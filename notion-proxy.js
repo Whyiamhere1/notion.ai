@@ -21,37 +21,51 @@ let NOTION_TOKENS = [];
 const accountCache = new Map();
 
 function loadTokens() {
-  try {
-    const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
-    NOTION_TOKENS = raw
-      .split(/[\r\n]+|token_v2=/)
-      .map(l => l.trim())
-      .filter(Boolean)
-      .map(token => {
-        let cleaned = token;
-        if (cleaned.startsWith('token_v2=')) {
-          cleaned = cleaned.replace('token_v2=', '');
-        }
-        try { cleaned = decodeURIComponent(cleaned); } catch {}
-        return cleaned.trim();
-      });
-    console.log(`[PROXY] Loaded ${NOTION_TOKENS.length} tokens.`);
-  } catch {
-    console.warn('[WARNING] notion-tokens.txt not found.');
-    NOTION_TOKENS = [];
+  NOTION_TOKENS = [];
+
+  // 1. Try loading from Environment Variable (for Render)
+  if (process.env.NOTION_TOKENS) {
+    NOTION_TOKENS = process.env.NOTION_TOKENS
+      .split(/[\r\n,]+|token_v2=/)
+      .map(t => t.trim().replace('token_v2=', ''))
+      .filter(Boolean);
+  }
+
+  // 2. Fallback to notion-tokens.txt file
+  if (!NOTION_TOKENS.length) {
+    try {
+      const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
+      NOTION_TOKENS = raw
+        .split(/[\r\n]+|token_v2=/)
+        .map(l => l.trim())
+        .filter(Boolean)
+        .map(token => {
+          let cleaned = token;
+          if (cleaned.startsWith('token_v2=')) {
+            cleaned = cleaned.replace('token_v2=', '');
+          }
+          try { cleaned = decodeURIComponent(cleaned); } catch {}
+          return cleaned.trim();
+        });
+    } catch {
+      console.warn(`[WARNING] notion-tokens.txt not found on disk.`);
+    }
+  }
+
+  if (NOTION_TOKENS.length > 0) {
+    console.log(`[PROXY] Successfully loaded ${NOTION_TOKENS.length} Notion tokens.`);
+  } else {
+    console.warn(`[WARNING] No Notion tokens available in environment or notion-tokens.txt.`);
   }
 }
 
 const MODEL_MAP = {
-  "claude-fable-5": "anthropic-sonnet-3.5-stable",
-  "fable-5": "anthropic-sonnet-3.5-stable",
-  "claude-sonnet-5": "anthropic-sonnet-3.5-stable",
-  "claude-opus-5": "anthropic-opus-4.8",
-  "gpt-4o": "openai-gpt-4o",
-  "gpt-5.6-sol": "openai-gpt-5.6-sol",
-  "gemini-3.6-flash": "vertex-gemini-3.6-flash",
-  "deepseek-v4-pro": "deepseek-v4-pro",
-  "default": "anthropic-sonnet-3.5-stable"
+  "claude-fable-5": "claude-fable-5",
+  "fable-5": "claude-fable-5",
+  "claude-sonnet-5": "claude-sonnet-5",
+  "claude-opus-5": "claude-opus-5",
+  "gpt-4o": "gpt-4o",
+  "default": "claude-fable-5"
 };
 
 let currentTokenIndex = 0;
@@ -59,79 +73,14 @@ let currentTokenIndex = 0;
 function getNextNotionToken() {
   if (!NOTION_TOKENS.length) {
     loadTokens();
-    if (!NOTION_TOKENS.length) throw new Error("No Notion tokens available.");
+    if (!NOTION_TOKENS.length) throw new Error("No Notion tokens available in pool.");
   }
   const token = NOTION_TOKENS[currentTokenIndex];
   currentTokenIndex = (currentTokenIndex + 1) % NOTION_TOKENS.length;
   return token;
 }
 
-// ── FETCH A REAL PAGE ID FROM THE SPACE ──────────────────────────────
-
-async function getFirstPageId(rawToken, spaceId, userId, proxyUrl) {
-  const cookie = `token_v2=${rawToken}`;
-  let agent;
-  if (proxyUrl) {
-    if (proxyUrl.startsWith('socks')) {
-      const Agent = await loadSPA();
-      agent = new Agent(proxyUrl);
-    } else {
-      const Agent = await loadHSPA();
-      agent = new Agent(proxyUrl);
-    }
-  }
-
-  // Query the space to get a page ID (use the search endpoint or load the space)
-  return new Promise((resolve) => {
-    const postData = JSON.stringify({
-      query: "",
-      spaceId: spaceId,
-      limit: 1
-    });
-
-    const req = https.request({
-      hostname: 'www.notion.so',
-      port: 443,
-      path: '/api/v3/search',
-      method: 'POST',
-      agent,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-        'Cookie': cookie,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Origin': 'https://www.notion.so',
-        'Referer': 'https://www.notion.so/',
-        'x-notion-active-user-header': userId,
-        'x-notion-space-id': spaceId
-      }
-    }, res => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(body);
-          // Look for the first page in the results
-          if (json.results && json.results.length > 0) {
-            const first = json.results[0];
-            if (first.id) {
-              console.log(`[PROXY] Using pageId: ${first.id}`);
-              return resolve(first.id);
-            }
-          }
-        } catch (e) {}
-        // Fallback: generate a random UUID (may not work)
-        console.warn('[PROXY] Could not find a real page; using random UUID. Might fail.');
-        resolve(crypto.randomUUID());
-      });
-    });
-    req.on('error', () => resolve(crypto.randomUUID()));
-    req.write(postData);
-    req.end();
-  });
-}
-
-// ── WORKSPACE CREATOR ────────────────────────────────────────────────────
+// ── WORKSPACE CREATOR ENDPOINT ──────────────────────────────────────────────
 
 async function createSpace(rawToken, userId, proxyUrl) {
   const cookie = `token_v2=${rawToken}`;
@@ -159,7 +108,7 @@ async function createSpace(rawToken, userId, proxyUrl) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData),
         'Cookie': cookie,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
         'x-notion-active-user-header': userId
@@ -169,7 +118,7 @@ async function createSpace(rawToken, userId, proxyUrl) {
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
         if (res.statusCode === 429) {
-          console.error('[PROXY] createSpace hit Rate Limit.');
+          console.error(`[PROXY] createSpace hit Rate Limit (429) on IP.`);
           return resolve(null);
         }
         try {
@@ -183,13 +132,14 @@ async function createSpace(rawToken, userId, proxyUrl) {
         resolve(null);
       });
     });
+
     req.on('error', () => resolve(null));
     req.write(postData);
     req.end();
   });
 }
 
-// ── ACCOUNT RESOLVER ────────────────────────────────────────────────────
+// ── ACCOUNT RESOLVER ────────────────────────────────────────────────────────
 
 async function getNotionAccountInfo(rawToken, proxyUrl) {
   const cookie = `token_v2=${rawToken}`;
@@ -205,6 +155,7 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   }
 
   return new Promise((resolve, reject) => {
+    const postData = JSON.stringify({});
     const req = https.request({
       hostname: 'www.notion.so',
       port: 443,
@@ -213,9 +164,9 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
       agent,
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': '2',
+        'Content-Length': Buffer.byteLength(postData),
         'Cookie': cookie,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/'
       }
@@ -230,38 +181,56 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
 
           const rootKeys = Object.keys(json);
           if (rootKeys.length > 0) {
-            userId = rootKeys[0];
-            const userEntry = json[userId];
-            if (userEntry && userEntry.space) {
-              const sKeys = Object.keys(userEntry.space);
-              if (sKeys.length > 0) spaceId = sKeys[0];
+            const firstUserKey = rootKeys[0];
+            const userData = json[firstUserKey];
+
+            if (userData) {
+              if (userData.notion_user) {
+                userId = Object.keys(userData.notion_user)[0] || firstUserKey;
+              } else {
+                userId = firstUserKey;
+              }
+              if (userData.space) {
+                const sKeys = Object.keys(userData.space);
+                if (sKeys.length > 0) spaceId = sKeys[0];
+              }
             }
           }
 
-          if (userId && !spaceId) {
-            console.log(`[PROXY] No space for ${userId}, creating...`);
+          const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          const isValidUser = userId && uuidRegex.test(userId);
+
+          if (!isValidUser) {
+            return reject(new Error("Failed to resolve a valid User UUID."));
+          }
+
+          const isValidSpace = spaceId && uuidRegex.test(spaceId);
+          if (!isValidSpace) {
+            console.log(`[PROXY] Account ${userId} has no valid space. Attempting auto-creation...`);
             spaceId = await createSpace(rawToken, userId, proxyUrl);
           }
 
-          if (userId && spaceId) {
-            console.log(`[PROXY] User: ${userId} | Space: ${spaceId}`);
+          if (userId && spaceId && uuidRegex.test(spaceId)) {
+            console.log(`[PROXY] Account Resolved -> User: ${userId} | Space: ${spaceId}`);
             return resolve({ spaceId, userId });
           }
-          reject(new Error('No workspace found or created.'));
+
+          reject(new Error(`Notion account missing workspace.`));
         } catch (e) {
-          reject(new Error(`Failed to parse getSpaces: ${e.message}`));
+          reject(new Error(`Failed to parse getSpaces response: ${e.message}`));
         }
       });
     });
+
     req.on('error', reject);
-    req.write('{}');
+    req.write(postData);
     req.end();
   });
 }
 
-// ── NOTION AI REQUEST – USING CORRECT SCHEMA ─────────────────────────
+// ── HTTP PROXY TRANSPORT ────────────────────────────────────────────────────
 
-async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
+async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
   const cookie = `token_v2=${rawToken}`;
   let agent;
   if (proxyUrl) {
@@ -276,54 +245,21 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
 
   const postData = JSON.stringify(payload);
 
-  const tlsAgent = new https.Agent({
-    secureOptions: crypto.constants.SSL_OP_NO_SSLv3 | crypto.constants.SSL_OP_NO_TLSv1 | crypto.constants.SSL_OP_NO_TLSv1_1,
-    ciphers: [
-      'TLS_AES_256_GCM_SHA384',
-      'TLS_CHACHA20_POLY1305_SHA256',
-      'TLS_AES_128_GCM_SHA256',
-      'ECDHE-ECDSA-AES128-GCM-SHA256',
-      'ECDHE-RSA-AES128-GCM-SHA256',
-      'ECDHE-ECDSA-AES256-GCM-SHA384',
-      'ECDHE-RSA-AES256-GCM-SHA384',
-      'ECDHE-ECDSA-CHACHA20-POLY1305',
-      'ECDHE-RSA-CHACHA20-POLY1305',
-      'ECDHE-RSA-AES128-SHA',
-      'ECDHE-RSA-AES256-SHA'
-    ].join(':'),
-    honorCipherOrder: true
-  });
-
   return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: 'www.notion.so',
       port: 443,
       path: '/api/v3/runInferenceTranscript',
       method: 'POST',
-      agent: agent || tlsAgent,
+      agent,
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'application/x-ndjson',
         'Content-Length': Buffer.byteLength(postData),
         'Cookie': cookie,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-        'Priority': 'u=1, i',
-        'TE': 'trailers',
-        'Connection': 'keep-alive',
-        'x-notion-active-user-header': userId,
-        'x-notion-space-id': spaceId,
-        'x-notion-client-version': '23.13.20260802.1530',
-        'notion-audit-log-platform': 'web'
+        'x-notion-active-user-header': userId
       }
     }, res => {
       resolve(res);
@@ -353,102 +289,35 @@ function packMessagesForNotion(messages) {
   return promptText.trim();
 }
 
-// ── PARSER ──────────────────────────────────────────────────────────────
-
-function extractTextFromData(data) {
-  if (data.text) return data.text;
-  if (data.delta) return data.delta;
-  if (data.type === 'markdown-chat') return data.value || '';
-  if (data.type === 'patch' && Array.isArray(data.v)) {
-    let acc = '';
-    for (const op of data.v) {
-      if (!op || typeof op !== 'object') continue;
-      const opType = op.o;
-      const path = Array.isArray(op.p) ? op.p.join('/') : (op.p || '');
-      const val = op.v;
-      if (opType === 'a' && path.endsWith('/s/-') && val && val.type === 'markdown-chat') {
-        if (val.value) acc += val.value;
-      } else if (opType === 'x' && path.includes('/s/') && path.endsWith('/value') && typeof val === 'string') {
-        acc += val;
-      } else if (opType === 'x' && path.includes('/value/') && typeof val === 'string') {
-        acc += val;
-      } else if (opType === 'a' && path.endsWith('/value/-') && val && val.type === 'text') {
-        if (val.content) acc += val.content;
-      }
-    }
-    return acc;
-  }
-  if (data.type === 'record-map' && data.recordMap) {
-    const rm = data.recordMap;
-    if (rm.thread_message) {
-      let acc = '';
-      for (const msgId in rm.thread_message) {
-        const msg = rm.thread_message[msgId];
-        const step = msg?.value?.value?.step;
-        if (!step) continue;
-        if (step.type === 'markdown-chat' && step.value) acc += step.value;
-        else if (step.type === 'agent-inference' && Array.isArray(step.value)) {
-          for (const item of step.value) {
-            if (item && item.type === 'text' && item.content) {
-              acc += item.content;
-              break;
-            }
-          }
-        }
-      }
-      return acc;
-    }
-  }
-  if (data.type === 'text' && data.value) return data.value;
-  return '';
-}
-
-function parseNotionResponse(rawBuffer) {
-  const trimmed = rawBuffer.trim();
-  if (trimmed.startsWith('[')) {
-    try {
-      const array = JSON.parse(trimmed);
-      let full = '';
-      for (const item of array) {
-        const text = extractTextFromData(item);
-        if (text) full += text;
-      }
-      return full;
-    } catch (e) { /* fall through */ }
-  }
-  const lines = trimmed.split('\n').filter(line => line.trim() !== '');
-  let full = '';
-  for (const line of lines) {
-    try {
-      const data = JSON.parse(line);
-      const text = extractTextFromData(data);
-      if (text) full += text;
-    } catch (e) { /* skip */ }
-  }
-  return full;
-}
-
-// ── OPENAI ROUTES ──────────────────────────────────────────────────────
+// ── OPENAI ROUTES ────────────────────────────────────────────────────────────
 
 app.get('/v1/models', (req, res) => {
   res.json({
     object: "list",
-    data: Object.keys(MODEL_MAP).map(m => ({
-      id: m,
-      object: "model",
-      created: Math.floor(Date.now() / 1000),
-      owned_by: "notion-ai"
-    }))
+    data: Object.keys(MODEL_MAP).map(m => ({ id: m, object: "model", created: 1700000000, owned_by: "notion-ai" }))
   });
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
-  const requestedModel = req.body.model || "claude-fable-5";
-  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-3.5-stable";
-  const stream = req.body.stream !== undefined ? req.body.stream : true;
 
-  const promptText = packMessagesForNotion(req.body.messages || []);
+  // 1. Validation: Reject Empty Messages List
+  if (!req.body.messages || !Array.isArray(req.body.messages) || req.body.messages.length === 0) {
+    return res.status(400).json({
+      error: { message: '"messages" must be a non-empty array', type: "invalid_request", code: 400 }
+    });
+  }
+
+  // 2. Validation: Reject Unknown Models
+  const requestedModel = req.body.model || "claude-fable-5";
+  const notionModel = MODEL_MAP[requestedModel.toLowerCase()];
+  if (!notionModel) {
+    return res.status(400).json({
+      error: { message: `Unknown model "${requestedModel}". Use GET /v1/models for available models.`, type: "invalid_request", code: 400 }
+    });
+  }
+
+  const promptText = packMessagesForNotion(req.body.messages);
   const tokenCookie = getNextNotionToken();
   const proxyUrl = process.env.ROTATING_PROXY_URL || undefined;
 
@@ -459,31 +328,40 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // ── Get a real pageId from the workspace ──────────────────────────
-    const pageId = await getFirstPageId(tokenCookie, accountInfo.spaceId, accountInfo.userId, proxyUrl);
-
-    // ── NEW CORRECT PAYLOAD ────────────────────────────────────────────
     const notionPayload = {
-      task: "inference",
-      model: notionModel,
-      context: {
-        type: "transcript",
-        pageId: pageId,
-        spaceId: accountInfo.spaceId
-      },
-      inferenceRequest: {
-        type: "transcript_prompt",
-        transcript: promptText
-      },
-      traceId: crypto.randomUUID()
+      traceId: crypto.randomUUID(),
+      spaceId: accountInfo.spaceId,
+      transcript: [
+        {
+          id: crypto.randomUUID(),
+          type: "config",
+          value: {
+            type: "thread",
+            model: notionModel,
+            useWebSearch: true
+          }
+        },
+        {
+          id: crypto.randomUUID(),
+          type: "context",
+          value: {
+            userName: "User",
+            surface: "workflows"
+          }
+        },
+        {
+          id: crypto.randomUUID(),
+          type: "user",
+          value: [[ promptText ]],
+          userId: accountInfo.userId,
+          createdAt: new Date().toISOString()
+        }
+      ]
     };
 
-    console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId} | Page: ${pageId}`);
-    console.log('[DEBUG] Payload:', JSON.stringify(notionPayload, null, 2));
+    console.log(`[REQUEST] Model: ${notionModel} | Space: ${accountInfo.spaceId} | User: ${accountInfo.userId}`);
 
-    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
-
-    console.log(`[DEBUG] Status: ${notionRes.statusCode}`);
+    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl);
 
     if (notionRes.statusCode >= 400) {
       let body = '';
@@ -495,52 +373,80 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    // ── Read response ──────────────────────────────────────────────────
-    let fullBuffer = '';
-    notionRes.on('data', chunk => { fullBuffer += chunk.toString(); });
+    // Set headers for stream output
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
 
-    await new Promise((resolve, reject) => {
-      notionRes.on('end', resolve);
-      notionRes.on('error', reject);
+    // Send initial structure and live connection keepalive pings
+    res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
+    res.write(': keepalive\n\n');
+
+    const keepAliveInterval = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(': keepalive\n\n');
+      }
+    }, 15000);
+
+    let isFirstChunk = true;
+    let streamBuffer = "";
+
+    notionRes.on('data', chunk => {
+      let raw = chunk.toString();
+
+      // Buffer the start of the stream to seamlessly clean language XML tags
+      if (isFirstChunk) {
+        streamBuffer += raw;
+        if (streamBuffer.length > 60 || !streamBuffer.includes('<')) {
+          isFirstChunk = false;
+          // Apply Regex cleanup to remove injected lang/thought prompts [1.1.1, 1.1.3]
+          streamBuffer = streamBuffer.replace(/<lang\s+primary="[^"]*"\s*\/?>\n*/gi, '');
+          streamBuffer = streamBuffer.replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, '');
+          streamBuffer = streamBuffer.replace(/<thought>[\s\S]*?<\/thought>\s*/gi, '');
+          raw = streamBuffer;
+        } else {
+          return; // Wait for the full XML block to buffer
+        }
+      }
+
+      const lines = raw.split('\n').filter(Boolean);
+
+      for (const line of lines) {
+        let textChunk = '';
+        try {
+          const parsed = JSON.parse(line);
+          textChunk = parsed.text || parsed.delta || (parsed.type === 'text' ? parsed.text : '');
+        } catch {
+          textChunk = line;
+        }
+
+        if (textChunk) {
+          // Verify no leftover partial tags slip through
+          textChunk = textChunk.replace(/<lang\s+primary="[^"]*"\s*\/?>\n*/gi, '');
+          res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
+        }
+      }
     });
 
-    const fullContent = parseNotionResponse(fullBuffer);
-    console.log(`[DEBUG] Extracted content length: ${fullContent.length}`);
-
-    const responseData = {
-      id: completionId,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: requestedModel,
-      choices: [{
-        index: 0,
-        message: {
-          role: 'assistant',
-          content: fullContent || '(empty response)'
-        },
-        finish_reason: 'stop'
-      }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    };
-
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
-      if (fullContent) {
-        res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: fullContent } }] })}\n\n`);
-      }
+    notionRes.on('end', () => {
+      clearInterval(keepAliveInterval);
       res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
-    } else {
-      res.json(responseData);
-    }
+    });
+
+    notionRes.on('error', () => {
+      clearInterval(keepAliveInterval);
+    });
 
   } catch (err) {
     console.error('[PROXY ERROR]', err.message);
+    
+    // Purge bad tokens out of memory pool
     accountCache.delete(tokenCookie);
+    NOTION_TOKENS = NOTION_TOKENS.filter(t => t !== tokenCookie);
+    console.log(`[PROXY] Purged broken token. Remaining tokens: ${NOTION_TOKENS.length}`);
+
     if (!res.headersSent) {
       res.status(500).json({ error: { message: err.message, type: 'notion_proxy_error' } });
     }
