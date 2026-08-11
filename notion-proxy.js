@@ -44,14 +44,15 @@ function loadTokens() {
 }
 
 // ── MODEL MAPPING ──────────────────────────────────────────────────────────
-// Maps client-requested model names to the active, working model IDs expected by Notion's servers
+// Maps client-requested models to "anthropic-sonnet-3.x-stable"
+// This is the only model that works reliably on free bot-created accounts without 400 errors.
 const MODEL_MAP = {
-  "claude-fable-5": "anthropic-sonnet-alt",   // Maps "Claude Fable 5" request to working Claude 3.5 Sonnet on backend
-  "fable-5": "anthropic-sonnet-alt",
-  "claude-sonnet-5": "anthropic-sonnet-alt",
-  "claude-opus-5": "anthropic-opus-4.1",       // Maps Claude 3 Opus
-  "gpt-4o": "openai-turbo",                   // Maps GPT-4o
-  "default": "anthropic-sonnet-alt"
+  "claude-fable-5": "anthropic-sonnet-3.x-stable", 
+  "fable-5": "anthropic-sonnet-3.x-stable",
+  "claude-sonnet-5": "anthropic-sonnet-3.x-stable",
+  "claude-opus-5": "anthropic-sonnet-3.x-stable",
+  "gpt-4o": "anthropic-sonnet-3.x-stable",
+  "default": "anthropic-sonnet-3.x-stable"
 };
 
 let currentTokenIndex = 0;
@@ -272,7 +273,7 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
   const requestedModel = req.body.model || "claude-fable-5";
-  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-alt";
+  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-3.x-stable";
 
   const promptText = packMessagesForNotion(req.body.messages || []);
   const tokenCookie = getNextNotionToken();
