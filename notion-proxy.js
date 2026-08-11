@@ -43,15 +43,31 @@ function loadTokens() {
   }
 }
 
-// ── MODEL MAPPING ──────────────────────────────────────────────────────────
-// Maps client-requested models to "anthropic-sonnet-3.x-stable"
-// This is the only model that works reliably on free bot-created accounts without 400 errors.
+// ── EXPANDED MODEL MAPPING ──────────────────────────────────────────────────
 const MODEL_MAP = {
-  "claude-fable-5": "anthropic-sonnet-3.x-stable", 
-  "fable-5": "anthropic-sonnet-3.x-stable",
+  // Anthropic
+  "claude-fable-5": "claude-fable-5",
+  "fable-5": "claude-fable-5",
   "claude-sonnet-5": "anthropic-sonnet-3.x-stable",
-  "claude-opus-5": "anthropic-sonnet-3.x-stable",
-  "gpt-4o": "anthropic-sonnet-3.x-stable",
+  "claude-opus-5": "anthropic-opus-4.8",
+
+  // OpenAI
+  "gpt-5.6-sol": "openai-gpt-5.6-sol",
+  "gpt-5.5": "openai-gpt-5.5",
+  "gpt-5.4": "openai-gpt-5.4",
+  "gpt-4o": "openai-gpt-4o",
+
+  // Google
+  "gemini-3.6-flash": "vertex-gemini-3.6-flash",
+
+  // DeepSeek
+  "deepseek-v4-pro": "deepseek-v4-pro",
+
+  // Other Common Models
+  "grok-4.5": "grok-4.5",
+  "kimi-k2.6": "kimi-k2.6",
+  "glm-5.2": "glm-5.2",
+  "qwen3.8-max": "qwen3.8-max",
   "default": "anthropic-sonnet-3.x-stable"
 };
 
@@ -200,9 +216,9 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT ────────────────────────────────────────────────────
+// ── HTTP PROXY TRANSPORT (UPDATED HEADERS) ─────────────────────────────────
 
-async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
+async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
   const cookie = `token_v2=${rawToken}`;
   let agent;
   if (proxyUrl) {
@@ -226,12 +242,16 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
       agent,
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'application/x-ndjson',                      // Added
         'Content-Length': Buffer.byteLength(postData),
         'Cookie': cookie,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
-        'x-notion-active-user-header': userId
+        'x-notion-active-user-header': userId,
+        'x-notion-space-id': spaceId,                          // Added
+        'x-notion-client-version': '23.13.20260313.1423',      // Added
+        'notion-audit-log-platform': 'web'                     // Added
       }
     }, res => {
       resolve(res);
@@ -263,10 +283,16 @@ function packMessagesForNotion(messages) {
 
 // ── OPENAI ROUTES ────────────────────────────────────────────────────────────
 
+// Dynamic list of all mapped models
 app.get('/v1/models', (req, res) => {
   res.json({
     object: "list",
-    data: Object.keys(MODEL_MAP).map(m => ({ id: m, object: "model", created: 1700000000, owned_by: "notion-ai" }))
+    data: Object.keys(MODEL_MAP).map(m => ({
+      id: m,
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: "notion-ai"
+    }))
   });
 });
 
@@ -286,9 +312,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
+    // ── UPDATED PAYLOAD SCHEMA ──────────────────────────────────────────────
+    const threadId = crypto.randomUUID();
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
+      threadId: threadId,                        // Added
+      createThread: true,                        // Added
+      isPartialTranscript: true,                 // Added
+      asPatchResponse: true,                     // Added
+      generateTitle: false,                      // Added
+      saveAllThreadOperations: true,             // Added
+      threadType: "markdown-chat",               // Added
       transcript: [
         {
           id: crypto.randomUUID(),
@@ -319,7 +354,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     console.log(`[REQUEST] Model Requested: ${requestedModel} -> Sent to Backend: ${notionModel} | Space: ${accountInfo.spaceId}`);
 
-    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl);
+    // Pass spaceId to fetchNotionAI
+    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
 
     if (notionRes.statusCode >= 400) {
       let body = '';
