@@ -6,15 +6,17 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
+// Apply stealth plugin to help bypass Cloudflare detection
 puppeteer.use(StealthPlugin());
 
 const TOKENS_FILE = path.join(__dirname, 'notion-tokens.txt');
-const TARGET_ACCOUNTS = 10;
+const TARGET_ACCOUNTS = 5; // Reduced default to minimize immediate banning
 
+// Helper function to make HTTPS JSON requests
 function requestJSON(url, options = {}, bodyData = null) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    const headers = { 'User-Agent': 'Mozilla/5.0', ...(options.headers || {}) };
+    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', ...(options.headers || {}) };
     let bodyString = bodyData ? JSON.stringify(bodyData) : null;
     if (bodyString) {
       headers['Content-Type'] = 'application/json';
@@ -41,21 +43,24 @@ function requestJSON(url, options = {}, bodyData = null) {
   });
 }
 
+// Creates a temporary mailbox. Note: Notion frequently blocks mail.tm.
+// If registration fails, you may need to swap this out for a private email domain API.
 async function createTempMailbox() {
   const domains = await requestJSON('https://api.mail.tm/domains');
   if (!domains['hydra:member'] || !domains['hydra:member'].length) {
     throw new Error('No domains available from Mail.tm');
   }
   const domain = domains['hydra:member'][0].domain;
-  const username = 'bot_' + Math.random().toString(36).substring(2, 10);
+  const username = 'notion_user_' + Math.random().toString(36).substring(2, 10);
   const email = `${username}@${domain}`;
-  const password = 'Password_' + Math.random().toString(36).substring(2, 10);
+  const password = 'SecuredPass_' + Math.random().toString(36).substring(2, 10);
 
   await requestJSON('https://api.mail.tm/accounts', {}, { address: email, password });
   const tokenRes = await requestJSON('https://api.mail.tm/token', {}, { address: email, password });
   return { email, authToken: tokenRes.token };
 }
 
+// Waits for the 6-digit verification code from Notion
 async function waitForNotionCode(authToken) {
   for (let i = 0; i < 20; i++) {
     await new Promise(r => setTimeout(r, 2000));
@@ -73,39 +78,55 @@ async function waitForNotionCode(authToken) {
       if (match) return match[0];
     }
   }
-  throw new Error('Verification code timed out');
+  throw new Error('Verification code timed out. Notion might have blocked this email domain.');
 }
 
 async function createAccountWithWorkspace() {
   const { email, authToken } = await createTempMailbox();
   console.log(`[1/5] Temp Email Created: ${email}`);
 
+  // PROXY CONFIGURATION (Highly Recommended):
+  // Replace 'ip:port' with your rotating residential proxy to bypass IP bans.
+  const proxyServer = ''; // Example: 'http://127.0.0.1:8000'
+  
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-gpu',
+    '--window-size=1280,800'
+  ];
+
+  if (proxyServer) {
+    launchArgs.push(`--proxy-server=${proxyServer}`);
+  }
+
+  // Running headless: false (visible browser) reduces Cloudflare flagging significantly
   const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--headless=new', '--window-size=1280,800']
+    headless: false, 
+    args: launchArgs
   });
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
   try {
-    await page.goto('https://www.notion.so/signup', { waitUntil: 'networkidle2', timeout: 30000 });
-    await page.waitForSelector('input[type="email"]', { timeout: 15000 });
-    await page.type('input[type="email"]', email, { delay: 30 });
+    await page.goto('https://www.notion.so/signup', { waitUntil: 'networkidle2', timeout: 45000 });
+    await page.waitForSelector('input[type="email"]', { timeout: 20000 });
+    await page.type('input[type="email"]', email, { delay: 50 });
     await page.keyboard.press('Enter');
     console.log(`[2/5] Submitted email... waiting for code...`);
 
     const code = await waitForNotionCode(authToken);
     console.log(`[3/5] Received Code: ${code}`);
 
-    await page.waitForSelector('input[placeholder*="code"]', { timeout: 15000 }).catch(() => {});
-    await page.keyboard.type(code, { delay: 30 });
+    await page.waitForSelector('input[placeholder*="code"]', { timeout: 20000 }).catch(() => {});
+    await page.keyboard.type(code, { delay: 50 });
     await page.keyboard.press('Enter');
 
     console.log(`[4/5] Logging in & verifying Workspace...`);
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 7000));
 
-    // Verify or force workspace creation in browser session
+    // Execute internal workspace check & creation in browser context
     const verification = await page.evaluate(async () => {
       try {
         const spacesRes = await fetch('/api/v3/getSpaces', {
@@ -116,14 +137,14 @@ async function createAccountWithWorkspace() {
         const spacesData = await spacesRes.json();
         const userId = Object.keys(spacesData)[0];
 
-        if (!userId) return { success: false, reason: 'No userId found' };
+        if (!userId) return { success: false, reason: 'No userId resolved' };
 
         const userSpaces = spacesData[userId]?.space;
         if (userSpaces && Object.keys(userSpaces).length > 0) {
           return { success: true, spaceId: Object.keys(userSpaces)[0] };
         }
 
-        // Call createSpace endpoint inside browser
+        // Call workspace creation endpoint directly from browser session
         const createRes = await fetch('/api/v3/createSpace', {
           method: 'POST',
           headers: {
@@ -152,7 +173,7 @@ async function createAccountWithWorkspace() {
 
     const cookies = await page.cookies();
     const tokenCookie = cookies.find(c => c.name === 'token_v2');
-    if (!tokenCookie) throw new Error('token_v2 cookie not found');
+    if (!tokenCookie) throw new Error('token_v2 cookie was not issued by Notion.');
 
     const cleanToken = decodeURIComponent(tokenCookie.value);
     console.log(`[5/5] SUCCESS! Token verified with Space ID: ${verification.spaceId}`);
@@ -167,7 +188,7 @@ async function createAccountWithWorkspace() {
 }
 
 async function startBotFarm() {
-  console.log(`\n🤖 Starting Notion Bot Farm (With 10s Delay Between Accounts)...\n`);
+  console.log(`\n🤖 Starting Notion Account Automation...\n`);
   let successCount = 0;
 
   for (let i = 1; i <= TARGET_ACCOUNTS; i++) {
@@ -176,19 +197,18 @@ async function startBotFarm() {
       const cleanToken = await createAccountWithWorkspace();
       fs.appendFileSync(TOKENS_FILE, cleanToken + '\n', 'utf-8');
       successCount++;
-      console.log(`✅ Clean token saved to notion-tokens.txt\n`);
+      console.log(`✅ Token successfully saved to notion-tokens.txt\n`);
     } catch (e) {
       console.error(`❌ Account skipped: ${e.message}\n`);
     }
 
-    // 10 second delay between accounts to avoid triggering Notion's 429 rate limit
     if (i < TARGET_ACCOUNTS) {
-      console.log(`⏳ Waiting 10 seconds before next account to prevent rate-limits...`);
-      await new Promise(r => setTimeout(r, 10000));
+      console.log(`⏳ Waiting 15 seconds to stay under the rate-limit radar...`);
+      await new Promise(r => setTimeout(r, 15000));
     }
   }
 
-  console.log(`🎉 Finished! Saved ${successCount} valid accounts with workspaces.\n`);
+  console.log(`🎉 Process Finished! Saved ${successCount} active tokens.\n`);
 }
 
 startBotFarm();
