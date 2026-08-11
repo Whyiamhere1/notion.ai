@@ -242,16 +242,16 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
       agent,
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'application/x-ndjson',                      // Added
+        'Accept': 'application/x-ndjson',
         'Content-Length': Buffer.byteLength(postData),
         'Cookie': cookie,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
         'x-notion-active-user-header': userId,
-        'x-notion-space-id': spaceId,                          // Added
-        'x-notion-client-version': '23.13.20260313.1423',      // Added
-        'notion-audit-log-platform': 'web'                     // Added
+        'x-notion-space-id': spaceId,
+        'x-notion-client-version': '23.13.20260313.1423',
+        'notion-audit-log-platform': 'web'
       }
     }, res => {
       resolve(res);
@@ -279,6 +279,162 @@ function packMessagesForNotion(messages) {
     }
   }
   return promptText.trim();
+}
+
+// ── HELPER: REGISTER THREAD BEFORE INFERENCE ───────────────────────────────
+
+async function createNotionThread(rawToken, userId, spaceId, proxyUrl) {
+  const threadId = crypto.randomUUID();
+  const cookie = `token_v2=${rawToken}`;
+  let agent;
+  if (proxyUrl) {
+    if (proxyUrl.startsWith('socks')) {
+      const Agent = await loadSPA();
+      agent = new Agent(proxyUrl);
+    } else {
+      const Agent = await loadHSPA();
+      agent = new Agent(proxyUrl);
+    }
+  }
+
+  const payload = {
+    requestId: crypto.randomUUID(),
+    transactions: [{
+      id: crypto.randomUUID(),
+      spaceId: spaceId,
+      operations: [{
+        pointer: { table: "thread", id: threadId, spaceId: spaceId },
+        path: [],
+        command: "set",
+        args: {
+          id: threadId,
+          version: 1,
+          alive: true,
+          type: "markdown-chat"
+        }
+      }]
+    }]
+  };
+
+  const postData = JSON.stringify(payload);
+
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'www.notion.so',
+      port: 443,
+      path: '/api/v3/saveTransactionsFanout',
+      method: 'POST',
+      agent,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cookie': cookie,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://www.notion.so',
+        'Referer': 'https://www.notion.so/',
+        'x-notion-active-user-header': userId,
+        'x-notion-space-id': spaceId,
+        'x-notion-client-version': '23.13.20260313.1423'
+      }
+    }, res => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(threadId);
+        } else {
+          reject(new Error(`Failed to initialize thread: HTTP ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+// ── HELPER: DEEP NESTED STREAM PARSER ──────────────────────────────────────
+
+function parseNotionLine(line) {
+  try {
+    const data = JSON.parse(line);
+
+    // 1. Direct old format fallbacks
+    if (data.text) return data.text;
+    if (data.delta) return data.delta;
+
+    // 2. Direct markdown-chat events
+    if (data.type === 'markdown-chat') {
+      return data.value || '';
+    }
+
+    // 3. Patches (Claude, GPT, and Gemini stream formats)
+    if (data.type === 'patch' && Array.isArray(data.v)) {
+      let accumulatedText = '';
+      for (const op of data.v) {
+        if (!op || typeof op !== 'object') continue;
+        
+        const opType = op.o; // operation command ('a' or 'x')
+        const path = Array.isArray(op.p) ? op.p.join('/') : (op.p || '');
+        const val = op.v;
+
+        // Gemini full content patch
+        if (opType === 'a' && path.endsWith('/s/-') && val && val.type === 'markdown-chat') {
+          if (val.value) accumulatedText += val.value;
+        }
+        // Gemini incremental patch
+        else if (opType === 'x' && path.includes('/s/') && path.endsWith('/value') && typeof val === 'string') {
+          accumulatedText += val;
+        }
+        // Claude and GPT incremental patch
+        else if (opType === 'x' && path.includes('/value/') && typeof val === 'string') {
+          accumulatedText += val;
+        }
+        // Claude and GPT full content patch
+        else if (opType === 'a' && path.endsWith('/value/-') && val && val.type === 'text') {
+          if (val.content) accumulatedText += val.content;
+        }
+      }
+      return accumulatedText;
+    }
+
+    // 4. Nested record-map data
+    if (data.type === 'record-map' && data.recordMap) {
+      const recordMap = data.recordMap;
+      if (recordMap.thread_message) {
+        let accumulatedText = '';
+        for (const msgId in recordMap.thread_message) {
+          const msgData = recordMap.thread_message[msgId];
+          const valueData = msgData?.value?.value;
+          const step = valueData?.step;
+          if (!step) continue;
+
+          if (step.type === 'markdown-chat') {
+            if (step.value) accumulatedText += step.value;
+          } else if (step.type === 'agent-inference') {
+            const agentValues = step.value;
+            if (Array.isArray(agentValues)) {
+              for (const item of agentValues) {
+                if (item && item.type === 'text' && item.content) {
+                  accumulatedText += item.content;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        return accumulatedText;
+      }
+    }
+
+    // 5. Raw text fallback
+    if (data.type === 'text' && data.value) {
+      return data.value;
+    }
+  } catch (err) {
+    // Silently skip incomplete JSON splits
+  }
+  return '';
 }
 
 // ── OPENAI ROUTES ────────────────────────────────────────────────────────────
@@ -312,18 +468,19 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // ── UPDATED PAYLOAD SCHEMA ──────────────────────────────────────────────
-    const threadId = crypto.randomUUID();
+    // Initialize/Pre-register the Thread on the workspace to support advanced models
+    const threadId = await createNotionThread(tokenCookie, accountInfo.userId, accountInfo.spaceId, proxyUrl);
+
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
-      threadId: threadId,                        // Added
-      createThread: true,                        // Added
-      isPartialTranscript: true,                 // Added
-      asPatchResponse: true,                     // Added
-      generateTitle: false,                      // Added
-      saveAllThreadOperations: true,             // Added
-      threadType: "markdown-chat",               // Added
+      threadId: threadId,
+      createThread: false, // Set to false since we registered it above
+      isPartialTranscript: true,
+      asPatchResponse: true,
+      generateTitle: false,
+      saveAllThreadOperations: true,
+      threadType: "markdown-chat",
       transcript: [
         {
           id: crypto.randomUUID(),
@@ -354,7 +511,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     console.log(`[REQUEST] Model Requested: ${requestedModel} -> Sent to Backend: ${notionModel} | Space: ${accountInfo.spaceId}`);
 
-    // Pass spaceId to fetchNotionAI
     const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
 
     if (notionRes.statusCode >= 400) {
@@ -373,19 +529,21 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
 
+    // Stream Buffer implementation
+    let buffer = '';
+
     notionRes.on('data', chunk => {
-      const raw = chunk.toString();
-      const lines = raw.split('\n').filter(Boolean);
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+
+      // Pop the last element (either an incomplete line or empty string)
+      buffer = lines.pop() || '';
 
       for (const line of lines) {
-        let textChunk = '';
-        try {
-          const parsed = JSON.parse(line);
-          textChunk = parsed.text || parsed.delta || (parsed.type === 'text' ? parsed.text : '');
-        } catch {
-          textChunk = line;
-        }
+        const trimmed = line.trim();
+        if (!trimmed) continue;
 
+        const textChunk = parseNotionLine(trimmed);
         if (textChunk) {
           res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
         }
@@ -393,6 +551,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
 
     notionRes.on('end', () => {
+      // Process remaining content in buffer
+      if (buffer.trim()) {
+        const textChunk = parseNotionLine(buffer.trim());
+        if (textChunk) {
+          res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
+        }
+      }
+
       res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
