@@ -38,18 +38,22 @@ function loadTokens() {
 
     console.log(`[PROXY] Successfully loaded ${NOTION_TOKENS.length} Notion tokens.`);
   } catch {
-    console.warn(`[WARNING] notion-tokens.txt not found.`);
+    console.warn(`[WARNING] notion-tokens.txt not found on startup.`);
     NOTION_TOKENS = [];
   }
 }
 
+// Updated 2026 Notion AI Model Mapping
 const MODEL_MAP = {
-  "claude-fable-5": "claude-fable-5",
-  "fable-5": "claude-fable-5",
-  "claude-sonnet-5": "claude-sonnet-5",
-  "claude-opus-5": "claude-opus-5",
-  "gpt-4o": "gpt-4o",
-  "default": "claude-fable-5"
+  "claude-sonnet-5": "anthropic-sonnet-alt",
+  "claude-sonnet": "anthropic-sonnet-alt",
+  "claude-sonnet-4.5": "anthropic-sonnet-alt",
+  "claude-opus-5": "anthropic-opus-4.1",
+  "claude-opus": "anthropic-opus-4.1",
+  "gpt-4o": "openai-turbo",
+  "gpt-5": "openai-turbo",
+  "gpt-4.1": "openai-gpt-4.1",
+  "default": "anthropic-sonnet-alt"
 };
 
 let currentTokenIndex = 0;
@@ -269,8 +273,8 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
-  const requestedModel = req.body.model || "claude-fable-5";
-  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "claude-fable-5";
+  const requestedModel = req.body.model || "claude-sonnet";
+  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-alt";
 
   const promptText = packMessagesForNotion(req.body.messages || []);
   const tokenCookie = getNextNotionToken();
@@ -283,6 +287,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
+    const threadId = crypto.randomUUID();
+    const threadType = "chat";
+
+    // Modern 2026 Notion Payload Schema (to avoid 400 ValidationErrors)
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
@@ -291,7 +299,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           id: crypto.randomUUID(),
           type: "config",
           value: {
-            type: "thread",
+            type: threadType,
             model: notionModel,
             useWebSearch: true
           }
@@ -311,7 +319,14 @@ app.post('/v1/chat/completions', async (req, res) => {
           userId: accountInfo.userId,
           createdAt: new Date().toISOString()
         }
-      ]
+      ],
+      threadId: threadId,
+      createThread: false,
+      isPartialTranscript: true,
+      asPatchResponse: true,
+      generateTitle: true,
+      saveAllThreadOperations: true,
+      threadType: threadType
     };
 
     console.log(`[REQUEST] Model: ${notionModel} | Space: ${accountInfo.spaceId} | User: ${accountInfo.userId}`);
