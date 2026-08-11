@@ -43,14 +43,14 @@ function loadTokens() {
   }
 }
 
-// ── MODEL MAPPING (use the original identifiers that worked) ──────────────
+// ── MODEL MAPPING ──────────────────────────────────────────────────────────
 const MODEL_MAP = {
   "claude-fable-5": "claude-fable-5",
   "fable-5": "claude-fable-5",
   "claude-sonnet-5": "claude-sonnet-5",
   "claude-opus-5": "claude-opus-5",
   "gpt-4o": "gpt-4o",
-  "gpt-5.6-sol": "gpt-5.6-sol",       // if Notion supports these
+  "gpt-5.6-sol": "gpt-5.6-sol",
   "gemini-3.6-flash": "gemini-3.6-flash",
   "deepseek-v4-pro": "deepseek-v4-pro",
   "default": "claude-fable-5"
@@ -201,9 +201,9 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT (UPDATED HEADERS) ─────────────────────────────────
+// ── HTTP PROXY TRANSPORT (ORIGINAL HEADERS ONLY) ──────────────────────────
 
-async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
+async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
   const cookie = `token_v2=${rawToken}`;
   let agent;
   if (proxyUrl) {
@@ -227,16 +227,12 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
       agent,
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'application/x-ndjson',
         'Content-Length': Buffer.byteLength(postData),
         'Cookie': cookie,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
-        'x-notion-active-user-header': userId,
-        'x-notion-space-id': spaceId,
-        'x-notion-client-version': '23.13.20260313.1423',
-        'notion-audit-log-platform': 'web'
+        'x-notion-active-user-header': userId
       }
     }, res => {
       resolve(res);
@@ -382,7 +378,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // ── ORIGINAL PAYLOAD STRUCTURE (without threadId, createThread, etc.) ──
+    // ── ORIGINAL PAYLOAD STRUCTURE ──────────────────────────────────────
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
@@ -416,10 +412,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId}`);
 
-    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
-
-    console.log(`[DEBUG] Notion response status: ${notionRes.statusCode}`);
-    console.log(`[DEBUG] Headers:`, notionRes.headers);
+    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl);
 
     if (notionRes.statusCode >= 400) {
       let body = '';
@@ -433,11 +426,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // ── Read full response ──────────────────────────────────────────────
     let fullBuffer = '';
-    notionRes.on('data', chunk => {
-      const str = chunk.toString();
-      console.log('[DEBUG] Chunk:', str);
-      fullBuffer += str;
-    });
+    notionRes.on('data', chunk => { fullBuffer += chunk.toString(); });
 
     await new Promise((resolve, reject) => {
       notionRes.on('end', resolve);
