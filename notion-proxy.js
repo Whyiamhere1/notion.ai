@@ -43,23 +43,17 @@ function loadTokens() {
   }
 }
 
-// ── MODEL MAPPING – FORCE `anthropic-sonnet-3.x-stable` (most permissive) ──
+// ── MODEL MAPPING (use the original identifiers that worked) ──────────────
 const MODEL_MAP = {
-  "claude-fable-5": "anthropic-sonnet-3.x-stable",
-  "fable-5": "anthropic-sonnet-3.x-stable",
-  "claude-sonnet-5": "anthropic-sonnet-3.x-stable",
-  "claude-opus-5": "anthropic-opus-4.8",
-  "gpt-5.6-sol": "openai-gpt-5.6-sol",
-  "gpt-5.5": "openai-gpt-5.5",
-  "gpt-5.4": "openai-gpt-5.4",
-  "gpt-4o": "openai-gpt-4o",
-  "gemini-3.6-flash": "vertex-gemini-3.6-flash",
+  "claude-fable-5": "claude-fable-5",
+  "fable-5": "claude-fable-5",
+  "claude-sonnet-5": "claude-sonnet-5",
+  "claude-opus-5": "claude-opus-5",
+  "gpt-4o": "gpt-4o",
+  "gpt-5.6-sol": "gpt-5.6-sol",       // if Notion supports these
+  "gemini-3.6-flash": "gemini-3.6-flash",
   "deepseek-v4-pro": "deepseek-v4-pro",
-  "grok-4.5": "grok-4.5",
-  "kimi-k2.6": "kimi-k2.6",
-  "glm-5.2": "glm-5.2",
-  "qwen3.8-max": "qwen3.8-max",
-  "default": "anthropic-sonnet-3.x-stable"
+  "default": "claude-fable-5"
 };
 
 let currentTokenIndex = 0;
@@ -207,7 +201,7 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT ──────────────────────────────────────────────────
+// ── HTTP PROXY TRANSPORT (UPDATED HEADERS) ─────────────────────────────────
 
 async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
   const cookie = `token_v2=${rawToken}`;
@@ -272,17 +266,13 @@ function packMessagesForNotion(messages) {
   return promptText.trim();
 }
 
-// ── DEEP PARSER (supports NDJSON + fallback JSON array) ──────────────────
+// ── PARSER (supports NDJSON and plain JSON arrays) ──────────────────────
 
 function extractTextFromData(data) {
-  // Direct fields
   if (data.text) return data.text;
   if (data.delta) return data.delta;
-
-  // Direct markdown-chat
   if (data.type === 'markdown-chat') return data.value || '';
 
-  // Patch
   if (data.type === 'patch' && Array.isArray(data.v)) {
     let acc = '';
     for (const op of data.v) {
@@ -290,27 +280,19 @@ function extractTextFromData(data) {
       const opType = op.o;
       const path = Array.isArray(op.p) ? op.p.join('/') : (op.p || '');
       const val = op.v;
-      // Gemini full
       if (opType === 'a' && path.endsWith('/s/-') && val && val.type === 'markdown-chat') {
         if (val.value) acc += val.value;
-      }
-      // Gemini incremental
-      else if (opType === 'x' && path.includes('/s/') && path.endsWith('/value') && typeof val === 'string') {
+      } else if (opType === 'x' && path.includes('/s/') && path.endsWith('/value') && typeof val === 'string') {
         acc += val;
-      }
-      // Claude/GPT incremental
-      else if (opType === 'x' && path.includes('/value/') && typeof val === 'string') {
+      } else if (opType === 'x' && path.includes('/value/') && typeof val === 'string') {
         acc += val;
-      }
-      // Claude/GPT full
-      else if (opType === 'a' && path.endsWith('/value/-') && val && val.type === 'text') {
+      } else if (opType === 'a' && path.endsWith('/value/-') && val && val.type === 'text') {
         if (val.content) acc += val.content;
       }
     }
     return acc;
   }
 
-  // Record-map
   if (data.type === 'record-map' && data.recordMap) {
     const rm = data.recordMap;
     if (rm.thread_message) {
@@ -333,14 +315,11 @@ function extractTextFromData(data) {
     }
   }
 
-  // Raw text
   if (data.type === 'text' && data.value) return data.value;
-
   return '';
 }
 
 function parseNotionResponse(rawBuffer) {
-  // If raw starts with '[' try parsing as JSON array
   const trimmed = rawBuffer.trim();
   if (trimmed.startsWith('[')) {
     try {
@@ -352,11 +331,10 @@ function parseNotionResponse(rawBuffer) {
       }
       return full;
     } catch (e) {
-      // fall through
+      // fall through to NDJSON parsing
     }
   }
 
-  // Otherwise treat as NDJSON (lines)
   const lines = trimmed.split('\n').filter(line => line.trim() !== '');
   let full = '';
   for (const line of lines) {
@@ -388,7 +366,7 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
   const requestedModel = req.body.model || "claude-fable-5";
-  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-3.x-stable";
+  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "claude-fable-5";
   const stream = req.body.stream !== undefined ? req.body.stream : true;
 
   const promptText = packMessagesForNotion(req.body.messages || []);
@@ -404,17 +382,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    const threadId = crypto.randomUUID();
+    // ── ORIGINAL PAYLOAD STRUCTURE (without threadId, createThread, etc.) ──
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
-      threadId: threadId,
-      createThread: true,
-      isPartialTranscript: true,
-      asPatchResponse: true,
-      generateTitle: false,
-      saveAllThreadOperations: true,
-      threadType: "markdown-chat",
       transcript: [
         {
           id: crypto.randomUUID(),
@@ -446,6 +417,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId}`);
 
     const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
+
+    console.log(`[DEBUG] Notion response status: ${notionRes.statusCode}`);
+    console.log(`[DEBUG] Headers:`, notionRes.headers);
 
     if (notionRes.statusCode >= 400) {
       let body = '';
