@@ -23,7 +23,7 @@ const accountCache = new Map();
 function loadTokens() {
   NOTION_TOKENS = [];
 
-  // 1. Try loading from Environment Variable (for Render)
+  // 1. Try loading from Environment Variable (Render-friendly)
   if (process.env.NOTION_TOKENS) {
     NOTION_TOKENS = process.env.NOTION_TOKENS
       .split(/[\r\n,]+|token_v2=/)
@@ -31,7 +31,7 @@ function loadTokens() {
       .filter(Boolean);
   }
 
-  // 2. Fallback to notion-tokens.txt file
+  // 2. Fallback to reading the local text file
   if (!NOTION_TOKENS.length) {
     try {
       const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
@@ -230,7 +230,7 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
 
 // ── HTTP PROXY TRANSPORT ────────────────────────────────────────────────────
 
-async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
+async function fetchNotionAI(payload, rawToken, userId, spaceId, proxyUrl) {
   const cookie = `token_v2=${rawToken}`;
   let agent;
   if (proxyUrl) {
@@ -259,7 +259,8 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
-        'x-notion-active-user-header': userId
+        'x-notion-active-user-header': userId,
+        'x-notion-space-id': spaceId
       }
     }, res => {
       resolve(res);
@@ -301,7 +302,7 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
 
-  // 1. Validation: Reject Empty Messages List
+  // 1. Validation: Reject Empty Messages
   if (!req.body.messages || !Array.isArray(req.body.messages) || req.body.messages.length === 0) {
     return res.status(400).json({
       error: { message: '"messages" must be a non-empty array', type: "invalid_request", code: 400 }
@@ -328,9 +329,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
+    const threadId = crypto.randomUUID();
     const notionPayload = {
-      traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
+      threadId: threadId,
+      createThread: true,
+      isPartialTranscript: true,
+      asPatchResponse: true,
       transcript: [
         {
           id: crypto.randomUUID(),
@@ -361,7 +366,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     console.log(`[REQUEST] Model: ${notionModel} | Space: ${accountInfo.spaceId} | User: ${accountInfo.userId}`);
 
-    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl);
+    const notionRes = await fetchNotionAI(
+      notionPayload, 
+      tokenCookie, 
+      accountInfo.userId, 
+      accountInfo.spaceId, 
+      proxyUrl
+    );
 
     if (notionRes.statusCode >= 400) {
       let body = '';
@@ -373,12 +384,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    // Set headers for stream output
+    // Set headers for output stream
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // Send initial structure and live connection keepalive pings
+    // Send initial structure and live keep-alive pings
     res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
     res.write(': keepalive\n\n');
 
@@ -394,18 +405,18 @@ app.post('/v1/chat/completions', async (req, res) => {
     notionRes.on('data', chunk => {
       let raw = chunk.toString();
 
-      // Buffer the start of the stream to seamlessly clean language XML tags
+      // Buffer initial chunks to block and remove language/thinking XML tags [1.1.1, 1.1.3]
       if (isFirstChunk) {
         streamBuffer += raw;
         if (streamBuffer.length > 60 || !streamBuffer.includes('<')) {
           isFirstChunk = false;
-          // Apply Regex cleanup to remove injected lang/thought prompts [1.1.1, 1.1.3]
+          // Apply regex filters to scrub systems tags
           streamBuffer = streamBuffer.replace(/<lang\s+primary="[^"]*"\s*\/?>\n*/gi, '');
           streamBuffer = streamBuffer.replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, '');
           streamBuffer = streamBuffer.replace(/<thought>[\s\S]*?<\/thought>\s*/gi, '');
           raw = streamBuffer;
         } else {
-          return; // Wait for the full XML block to buffer
+          return; // Continue buffering until safe
         }
       }
 
@@ -421,7 +432,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
 
         if (textChunk) {
-          // Verify no leftover partial tags slip through
+          // Extra cleanup filter
           textChunk = textChunk.replace(/<lang\s+primary="[^"]*"\s*\/?>\n*/gi, '');
           res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
         }
@@ -442,7 +453,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (err) {
     console.error('[PROXY ERROR]', err.message);
     
-    // Purge bad tokens out of memory pool
+    // Auto-purge broken or rate-limited tokens from the active pool
     accountCache.delete(tokenCookie);
     NOTION_TOKENS = NOTION_TOKENS.filter(t => t !== tokenCookie);
     console.log(`[PROXY] Purged broken token. Remaining tokens: ${NOTION_TOKENS.length}`);
