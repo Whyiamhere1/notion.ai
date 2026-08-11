@@ -31,7 +31,7 @@ function loadTokens() {
       .filter(Boolean);
   }
 
-  // 2. Fallback to reading the local text file
+  // 2. Fallback to reading local text file
   if (!NOTION_TOKENS.length) {
     try {
       const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
@@ -59,13 +59,16 @@ function loadTokens() {
   }
 }
 
+// ── CODENAME MODEL MAPPING (Notion's actual backend models) ────────────────
+
 const MODEL_MAP = {
-  "claude-fable-5": "claude-fable-5",
-  "fable-5": "claude-fable-5",
-  "claude-sonnet-5": "claude-sonnet-5",
-  "claude-opus-5": "claude-opus-5",
-  "gpt-4o": "gpt-4o",
-  "default": "claude-fable-5"
+  "claude-opus-5": "agave-flan",          // Claude Opus 5 [2.2.1, 2.2.2]
+  "opus": "agave-flan",
+  "claude-sonnet-5": "olive-jellyroll",    // Claude Sonnet 5
+  "sonnet": "olive-jellyroll",
+  "gpt-4o": "oval-kumquat-medium",        // GPT-5.4 / GPT-4o [4.2.1]
+  "gpt-4o-mini": "oregon-grape-medium",   // GPT-5.4 Mini [4.2.1]
+  "default": "agave-flan"
 };
 
 let currentTokenIndex = 0;
@@ -290,7 +293,7 @@ function packMessagesForNotion(messages) {
   return promptText.trim();
 }
 
-// ── OPENAI ROUTES ────────────────────────────────────────────────────────────
+// ── OPENAI COMPATIBLE ROUTES ─────────────────────────────────────────────────
 
 app.get('/v1/models', (req, res) => {
   res.json({
@@ -389,12 +392,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // Send initial structure and live keep-alive pings
+    // Send initial structure and live connection keep-alive pings
     res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
     res.write(': keepalive\n\n');
 
+    let streamEnded = false;
     const keepAliveInterval = setInterval(() => {
-      if (!res.writableEnded) {
+      if (!streamEnded) {
         res.write(': keepalive\n\n');
       }
     }, 15000);
@@ -441,6 +445,26 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     notionRes.on('end', () => {
       clearInterval(keepAliveInterval);
+      streamEnded = true;
+
+      // Handle Empty Response Case (Occurs when accounts hit 20-message free limits)
+      if (isFirstChunk && streamBuffer.length === 0) {
+        console.error(`[PROXY] Notion returned an empty response. This token is likely out of free credits (20 message limit)!`);
+        NOTION_TOKENS = NOTION_TOKENS.filter(t => t !== tokenCookie);
+        accountCache.delete(tokenCookie);
+        console.log(`[PROXY] Automatically purged dead token. Remaining: ${NOTION_TOKENS.length}`);
+        
+        if (!res.headersSent) {
+          res.status(400).json({ 
+            error: { 
+              message: "Notion account empty response. Your token has hit its 20-message free limit and has been purged.", 
+              type: "notion_empty_response" 
+            } 
+          });
+        }
+        return;
+      }
+
       res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
@@ -448,6 +472,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     notionRes.on('error', () => {
       clearInterval(keepAliveInterval);
+      streamEnded = true;
     });
 
   } catch (err) {
