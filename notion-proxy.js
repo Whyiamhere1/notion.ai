@@ -281,78 +281,6 @@ function packMessagesForNotion(messages) {
   return promptText.trim();
 }
 
-// ── HELPER: REGISTER THREAD BEFORE INFERENCE ───────────────────────────────
-
-async function createNotionThread(rawToken, userId, spaceId, proxyUrl) {
-  const threadId = crypto.randomUUID();
-  const cookie = `token_v2=${rawToken}`;
-  let agent;
-  if (proxyUrl) {
-    if (proxyUrl.startsWith('socks')) {
-      const Agent = await loadSPA();
-      agent = new Agent(proxyUrl);
-    } else {
-      const Agent = await loadHSPA();
-      agent = new Agent(proxyUrl);
-    }
-  }
-
-  const payload = {
-    requestId: crypto.randomUUID(),
-    transactions: [{
-      id: crypto.randomUUID(),
-      spaceId: spaceId,
-      operations: [{
-        pointer: { table: "thread", id: threadId, spaceId: spaceId },
-        path: [],
-        command: "set",
-        args: {
-          id: threadId,
-          version: 1,
-          alive: true,
-          type: "markdown-chat"
-        }
-      }]
-    }]
-  };
-
-  const postData = JSON.stringify(payload);
-
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'www.notion.so',
-      port: 443,
-      path: '/api/v3/saveTransactionsFanout',
-      method: 'POST',
-      agent,
-      headers: {
-        'Content-Type': 'application/json',
-        'Cookie': cookie,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Origin': 'https://www.notion.so',
-        'Referer': 'https://www.notion.so/',
-        'x-notion-active-user-header': userId,
-        'x-notion-space-id': spaceId,
-        'x-notion-client-version': '23.13.20260313.1423'
-      }
-    }, res => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(threadId);
-        } else {
-          reject(new Error(`Failed to initialize thread: HTTP ${res.statusCode}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.write(postData);
-    req.end();
-  });
-}
-
 // ── HELPER: DEEP NESTED STREAM PARSER ──────────────────────────────────────
 
 function parseNotionLine(line) {
@@ -468,14 +396,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // Initialize/Pre-register the Thread on the workspace to support advanced models
-    const threadId = await createNotionThread(tokenCookie, accountInfo.userId, accountInfo.spaceId, proxyUrl);
+    // Generate a new thread ID and let Notion create it by setting createThread: true
+    const threadId = crypto.randomUUID();
 
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
       threadId: threadId,
-      createThread: false, // Set to false since we registered it above
+      createThread: true,          // Let Notion create the thread
       isPartialTranscript: true,
       asPatchResponse: true,
       generateTitle: false,
