@@ -384,6 +384,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
   const requestedModel = req.body.model || "claude-fable-5";
   const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-3.x-stable";
+  const stream = req.body.stream !== undefined ? req.body.stream : true; // default true
 
   const promptText = packMessagesForNotion(req.body.messages || []);
   const tokenCookie = getNextNotionToken();
@@ -396,14 +397,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // Generate a new thread ID and let Notion create it by setting createThread: true
     const threadId = crypto.randomUUID();
-
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
       threadId: threadId,
-      createThread: true,          // Let Notion create the thread
+      createThread: true,
       isPartialTranscript: true,
       asPatchResponse: true,
       generateTitle: false,
@@ -437,7 +436,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       ]
     };
 
-    console.log(`[REQUEST] Model Requested: ${requestedModel} -> Sent to Backend: ${notionModel} | Space: ${accountInfo.spaceId}`);
+    console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId}`);
 
     const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
 
@@ -451,46 +450,64 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    // ── Read the entire NDJSON stream into a buffer ──────────────────────
+    let fullBuffer = '';
+    notionRes.on('data', chunk => { fullBuffer += chunk.toString(); });
 
-    res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
-
-    // Stream Buffer implementation
-    let buffer = '';
-
-    notionRes.on('data', chunk => {
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-
-      // Pop the last element (either an incomplete line or empty string)
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        const textChunk = parseNotionLine(trimmed);
-        if (textChunk) {
-          res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
-        }
-      }
+    await new Promise((resolve, reject) => {
+      notionRes.on('end', resolve);
+      notionRes.on('error', reject);
     });
 
-    notionRes.on('end', () => {
-      // Process remaining content in buffer
-      if (buffer.trim()) {
-        const textChunk = parseNotionLine(buffer.trim());
-        if (textChunk) {
-          res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
-        }
-      }
+    // ── Parse all lines to extract the complete answer ────────────────────
+    const lines = fullBuffer.split('\n').filter(line => line.trim() !== '');
+    let fullContent = '';
+    for (const line of lines) {
+      const chunk = parseNotionLine(line);
+      if (chunk) fullContent += chunk;
+    }
 
+    // ── If no content was extracted, log raw response for debugging ──────
+    if (!fullContent) {
+      console.warn('[WARNING] No content extracted from Notion. Raw NDJSON:', fullBuffer);
+    }
+
+    // ── Build the final completion ─────────────────────────────────────────
+    const responseData = {
+      id: completionId,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: requestedModel,
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: fullContent || '(empty response)'
+        },
+        finish_reason: 'stop'
+      }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    };
+
+    // ── Send either stream or standard JSON ──────────────────────────────
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      // Simulate streaming by sending the whole content in one chunk
+      // (you could also split it into tokens if desired)
+      res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
+      if (fullContent) {
+        res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: fullContent } }] })}\n\n`);
+      }
       res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
-    });
+    } else {
+      // Standard JSON response
+      res.json(responseData);
+    }
 
   } catch (err) {
     console.error('[PROXY ERROR]', err.message);
