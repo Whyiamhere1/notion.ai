@@ -2,9 +2,9 @@
   "name": "notion-proxy",
   "version": "1.0.0",
   "description": "Notion AI Proxy Server",
-  "main": "notion-proxy.js",
+  "main": "notion-proxy.js.txt",
   "scripts": {
-    "start": "node notion-proxy.js"
+    "start": "node notion-proxy.js.txt"
   },
   "dependencies": {
     "cors": "^2.8.5",
