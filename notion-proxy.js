@@ -42,17 +42,17 @@ function loadTokens() {
   }
 }
 
-// ── MODEL MAP – FORCE PERMISSIVE MODEL ────────────────────────────────
+// ── MODEL MAP – use the exact name from AI analysis ────────────────────
 const MODEL_MAP = {
-  "claude-fable-5": "anthropic-sonnet-3.x-stable",
-  "fable-5": "anthropic-sonnet-3.x-stable",
-  "claude-sonnet-5": "anthropic-sonnet-3.x-stable",
+  "claude-fable-5": "anthropic-sonnet-3.5-stable",
+  "fable-5": "anthropic-sonnet-3.5-stable",
+  "claude-sonnet-5": "anthropic-sonnet-3.5-stable",
   "claude-opus-5": "anthropic-opus-4.8",
   "gpt-4o": "openai-gpt-4o",
   "gpt-5.6-sol": "openai-gpt-5.6-sol",
   "gemini-3.6-flash": "vertex-gemini-3.6-flash",
   "deepseek-v4-pro": "deepseek-v4-pro",
-  "default": "anthropic-sonnet-3.x-stable"
+  "default": "anthropic-sonnet-3.5-stable"
 };
 
 let currentTokenIndex = 0;
@@ -195,7 +195,7 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   });
 }
 
-// ── NOTION AI REQUEST – WITH FULL BROWSER HEADERS ─────────────────────
+// ── NOTION AI REQUEST – NEW PAYLOAD SCHEMA ─────────────────────────────
 
 async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
   const cookie = `token_v2=${rawToken}`;
@@ -212,7 +212,6 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
 
   const postData = JSON.stringify(payload);
 
-  // Create a TLS agent that mimics a modern Chrome cipher suite
   const tlsAgent = new https.Agent({
     secureOptions: crypto.constants.SSL_OP_NO_SSLv3 | crypto.constants.SSL_OP_NO_TLSv1 | crypto.constants.SSL_OP_NO_TLSv1_1,
     ciphers: [
@@ -237,9 +236,8 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
       port: 443,
       path: '/api/v3/runInferenceTranscript',
       method: 'POST',
-      agent: agent || tlsAgent, // use custom agent if no proxy
+      agent: agent || tlsAgent,
       headers: {
-        // ── Standard headers ──
         'Content-Type': 'application/json',
         'Accept': 'application/x-ndjson',
         'Content-Length': Buffer.byteLength(postData),
@@ -247,7 +245,6 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
-        // ── Browser‑like headers ──
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
@@ -259,7 +256,6 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
         'Priority': 'u=1, i',
         'TE': 'trailers',
         'Connection': 'keep-alive',
-        // ── Notion‑specific ──
         'x-notion-active-user-header': userId,
         'x-notion-space-id': spaceId,
         'x-notion-client-version': '23.13.20260802.1530',
@@ -277,6 +273,7 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
 }
 
 function packMessagesForNotion(messages) {
+  // Build a single prompt string (the AI expects transcript as a string)
   let promptText = "";
   for (const m of messages) {
     const role = (m.role || "").toUpperCase();
@@ -293,7 +290,7 @@ function packMessagesForNotion(messages) {
   return promptText.trim();
 }
 
-// ── PARSER ──────────────────────────────────────────────────────────────
+// ── PARSER (unchanged) ──────────────────────────────────────────────────
 
 function extractTextFromData(data) {
   if (data.text) return data.text;
@@ -385,7 +382,7 @@ app.get('/v1/models', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
   const requestedModel = req.body.model || "claude-fable-5";
-  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-3.x-stable";
+  const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-3.5-stable";
   const stream = req.body.stream !== undefined ? req.body.stream : true;
 
   const promptText = packMessagesForNotion(req.body.messages || []);
@@ -399,36 +396,21 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // ── MINIMAL PAYLOAD ────────────────────────────────────────────────
+    // ── NEW PAYLOAD STRUCTURE ──────────────────────────────────────────
+    // We need a pageId – if not available, generate a random one (may fail)
+    // In the future, we could fetch a real page from the workspace
+    const pageId = crypto.randomUUID(); // placeholder
+
     const notionPayload = {
-      traceId: crypto.randomUUID(),
-      spaceId: accountInfo.spaceId,
-      transcript: [
-        {
-          id: crypto.randomUUID(),
-          type: "config",
-          value: {
-            type: "thread",
-            model: notionModel,
-            useWebSearch: true
-          }
-        },
-        {
-          id: crypto.randomUUID(),
-          type: "context",
-          value: {
-            userName: "User",
-            surface: "workflows"
-          }
-        },
-        {
-          id: crypto.randomUUID(),
-          type: "user",
-          value: [[ promptText ]],
-          userId: accountInfo.userId,
-          createdAt: new Date().toISOString()
-        }
-      ]
+      task: "inference",                // or "conversation" – adjust as needed
+      model: notionModel,
+      context: {
+        type: "transcript",
+        pageId: pageId,
+        spaceId: accountInfo.spaceId
+      },
+      transcript: promptText,           // now a plain string
+      traceId: crypto.randomUUID()
     };
 
     console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId}`);
@@ -502,7 +484,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 loadTokens();
 
-const PORT = process.env.PROCESS || 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================================`);
   console.log(`🚀 Notion AI Proxy Server running on http://localhost:${PORT}/v1`);
