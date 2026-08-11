@@ -43,27 +43,18 @@ function loadTokens() {
   }
 }
 
-// ── EXPANDED MODEL MAPPING ──────────────────────────────────────────────────
+// ── MODEL MAPPING – FORCE `anthropic-sonnet-3.x-stable` (most permissive) ──
 const MODEL_MAP = {
-  // Anthropic
-  "claude-fable-5": "claude-fable-5",
-  "fable-5": "claude-fable-5",
+  "claude-fable-5": "anthropic-sonnet-3.x-stable",
+  "fable-5": "anthropic-sonnet-3.x-stable",
   "claude-sonnet-5": "anthropic-sonnet-3.x-stable",
   "claude-opus-5": "anthropic-opus-4.8",
-
-  // OpenAI
   "gpt-5.6-sol": "openai-gpt-5.6-sol",
   "gpt-5.5": "openai-gpt-5.5",
   "gpt-5.4": "openai-gpt-5.4",
   "gpt-4o": "openai-gpt-4o",
-
-  // Google
   "gemini-3.6-flash": "vertex-gemini-3.6-flash",
-
-  // DeepSeek
   "deepseek-v4-pro": "deepseek-v4-pro",
-
-  // Other Common Models
   "grok-4.5": "grok-4.5",
   "kimi-k2.6": "kimi-k2.6",
   "glm-5.2": "glm-5.2",
@@ -83,7 +74,7 @@ function getNextNotionToken() {
   return token;
 }
 
-// ── WORKSPACE CREATOR ENDPOINT ──────────────────────────────────────────────
+// ── WORKSPACE CREATOR ──────────────────────────────────────────────────────
 
 async function createSpace(rawToken, userId, proxyUrl) {
   const cookie = `token_v2=${rawToken}`;
@@ -142,7 +133,7 @@ async function createSpace(rawToken, userId, proxyUrl) {
   });
 }
 
-// ── ACCOUNT RESOLVER ────────────────────────────────────────────────────────
+// ── ACCOUNT RESOLVER ──────────────────────────────────────────────────────
 
 async function getNotionAccountInfo(rawToken, proxyUrl) {
   const cookie = `token_v2=${rawToken}`;
@@ -216,7 +207,7 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT (UPDATED HEADERS) ─────────────────────────────────
+// ── HTTP PROXY TRANSPORT ──────────────────────────────────────────────────
 
 async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
   const cookie = `token_v2=${rawToken}`;
@@ -281,93 +272,107 @@ function packMessagesForNotion(messages) {
   return promptText.trim();
 }
 
-// ── HELPER: DEEP NESTED STREAM PARSER ──────────────────────────────────────
+// ── DEEP PARSER (supports NDJSON + fallback JSON array) ──────────────────
 
-function parseNotionLine(line) {
-  try {
-    const data = JSON.parse(line);
+function extractTextFromData(data) {
+  // Direct fields
+  if (data.text) return data.text;
+  if (data.delta) return data.delta;
 
-    // 1. Direct old format fallbacks
-    if (data.text) return data.text;
-    if (data.delta) return data.delta;
+  // Direct markdown-chat
+  if (data.type === 'markdown-chat') return data.value || '';
 
-    // 2. Direct markdown-chat events
-    if (data.type === 'markdown-chat') {
-      return data.value || '';
-    }
-
-    // 3. Patches (Claude, GPT, and Gemini stream formats)
-    if (data.type === 'patch' && Array.isArray(data.v)) {
-      let accumulatedText = '';
-      for (const op of data.v) {
-        if (!op || typeof op !== 'object') continue;
-        
-        const opType = op.o; // operation command ('a' or 'x')
-        const path = Array.isArray(op.p) ? op.p.join('/') : (op.p || '');
-        const val = op.v;
-
-        // Gemini full content patch
-        if (opType === 'a' && path.endsWith('/s/-') && val && val.type === 'markdown-chat') {
-          if (val.value) accumulatedText += val.value;
-        }
-        // Gemini incremental patch
-        else if (opType === 'x' && path.includes('/s/') && path.endsWith('/value') && typeof val === 'string') {
-          accumulatedText += val;
-        }
-        // Claude and GPT incremental patch
-        else if (opType === 'x' && path.includes('/value/') && typeof val === 'string') {
-          accumulatedText += val;
-        }
-        // Claude and GPT full content patch
-        else if (opType === 'a' && path.endsWith('/value/-') && val && val.type === 'text') {
-          if (val.content) accumulatedText += val.content;
-        }
+  // Patch
+  if (data.type === 'patch' && Array.isArray(data.v)) {
+    let acc = '';
+    for (const op of data.v) {
+      if (!op || typeof op !== 'object') continue;
+      const opType = op.o;
+      const path = Array.isArray(op.p) ? op.p.join('/') : (op.p || '');
+      const val = op.v;
+      // Gemini full
+      if (opType === 'a' && path.endsWith('/s/-') && val && val.type === 'markdown-chat') {
+        if (val.value) acc += val.value;
       }
-      return accumulatedText;
+      // Gemini incremental
+      else if (opType === 'x' && path.includes('/s/') && path.endsWith('/value') && typeof val === 'string') {
+        acc += val;
+      }
+      // Claude/GPT incremental
+      else if (opType === 'x' && path.includes('/value/') && typeof val === 'string') {
+        acc += val;
+      }
+      // Claude/GPT full
+      else if (opType === 'a' && path.endsWith('/value/-') && val && val.type === 'text') {
+        if (val.content) acc += val.content;
+      }
     }
+    return acc;
+  }
 
-    // 4. Nested record-map data
-    if (data.type === 'record-map' && data.recordMap) {
-      const recordMap = data.recordMap;
-      if (recordMap.thread_message) {
-        let accumulatedText = '';
-        for (const msgId in recordMap.thread_message) {
-          const msgData = recordMap.thread_message[msgId];
-          const valueData = msgData?.value?.value;
-          const step = valueData?.step;
-          if (!step) continue;
-
-          if (step.type === 'markdown-chat') {
-            if (step.value) accumulatedText += step.value;
-          } else if (step.type === 'agent-inference') {
-            const agentValues = step.value;
-            if (Array.isArray(agentValues)) {
-              for (const item of agentValues) {
-                if (item && item.type === 'text' && item.content) {
-                  accumulatedText += item.content;
-                  break;
-                }
-              }
+  // Record-map
+  if (data.type === 'record-map' && data.recordMap) {
+    const rm = data.recordMap;
+    if (rm.thread_message) {
+      let acc = '';
+      for (const msgId in rm.thread_message) {
+        const msg = rm.thread_message[msgId];
+        const step = msg?.value?.value?.step;
+        if (!step) continue;
+        if (step.type === 'markdown-chat' && step.value) acc += step.value;
+        else if (step.type === 'agent-inference' && Array.isArray(step.value)) {
+          for (const item of step.value) {
+            if (item && item.type === 'text' && item.content) {
+              acc += item.content;
+              break;
             }
           }
         }
-        return accumulatedText;
       }
+      return acc;
     }
-
-    // 5. Raw text fallback
-    if (data.type === 'text' && data.value) {
-      return data.value;
-    }
-  } catch (err) {
-    // Silently skip incomplete JSON splits
   }
+
+  // Raw text
+  if (data.type === 'text' && data.value) return data.value;
+
   return '';
 }
 
-// ── OPENAI ROUTES ────────────────────────────────────────────────────────────
+function parseNotionResponse(rawBuffer) {
+  // If raw starts with '[' try parsing as JSON array
+  const trimmed = rawBuffer.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const array = JSON.parse(trimmed);
+      let full = '';
+      for (const item of array) {
+        const text = extractTextFromData(item);
+        if (text) full += text;
+      }
+      return full;
+    } catch (e) {
+      // fall through
+    }
+  }
 
-// Dynamic list of all mapped models
+  // Otherwise treat as NDJSON (lines)
+  const lines = trimmed.split('\n').filter(line => line.trim() !== '');
+  let full = '';
+  for (const line of lines) {
+    try {
+      const data = JSON.parse(line);
+      const text = extractTextFromData(data);
+      if (text) full += text;
+    } catch (e) {
+      // skip invalid lines
+    }
+  }
+  return full;
+}
+
+// ── OPENAI ROUTES ──────────────────────────────────────────────────────────
+
 app.get('/v1/models', (req, res) => {
   res.json({
     object: "list",
@@ -384,9 +389,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
   const requestedModel = req.body.model || "claude-fable-5";
   const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || "anthropic-sonnet-3.x-stable";
-  const stream = req.body.stream !== undefined ? req.body.stream : true; // default true
+  const stream = req.body.stream !== undefined ? req.body.stream : true;
 
   const promptText = packMessagesForNotion(req.body.messages || []);
+  console.log(`[DEBUG] Prompt text: "${promptText}"`);
+
   const tokenCookie = getNextNotionToken();
   const proxyUrl = process.env.ROTATING_PROXY_URL || undefined;
 
@@ -450,29 +457,29 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    // ── Read the entire NDJSON stream into a buffer ──────────────────────
+    // ── Read full response ──────────────────────────────────────────────
     let fullBuffer = '';
-    notionRes.on('data', chunk => { fullBuffer += chunk.toString(); });
+    notionRes.on('data', chunk => {
+      const str = chunk.toString();
+      console.log('[DEBUG] Chunk:', str);
+      fullBuffer += str;
+    });
 
     await new Promise((resolve, reject) => {
       notionRes.on('end', resolve);
       notionRes.on('error', reject);
     });
 
-    // ── Parse all lines to extract the complete answer ────────────────────
-    const lines = fullBuffer.split('\n').filter(line => line.trim() !== '');
-    let fullContent = '';
-    for (const line of lines) {
-      const chunk = parseNotionLine(line);
-      if (chunk) fullContent += chunk;
-    }
+    console.log('[DEBUG] Full raw response:', fullBuffer);
 
-    // ── If no content was extracted, log raw response for debugging ──────
+    // ── Parse the response ──────────────────────────────────────────────
+    const fullContent = parseNotionResponse(fullBuffer);
+    console.log(`[DEBUG] Extracted content: "${fullContent}"`);
+
     if (!fullContent) {
-      console.warn('[WARNING] No content extracted from Notion. Raw NDJSON:', fullBuffer);
+      console.warn('[WARNING] No content extracted. Raw:', fullBuffer);
     }
 
-    // ── Build the final completion ─────────────────────────────────────────
     const responseData = {
       id: completionId,
       object: 'chat.completion',
@@ -489,14 +496,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
     };
 
-    // ── Send either stream or standard JSON ──────────────────────────────
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      // Simulate streaming by sending the whole content in one chunk
-      // (you could also split it into tokens if desired)
       res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
       if (fullContent) {
         res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: fullContent } }] })}\n\n`);
@@ -505,7 +509,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
-      // Standard JSON response
       res.json(responseData);
     }
 
