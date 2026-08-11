@@ -42,7 +42,6 @@ function loadTokens() {
   }
 }
 
-// ── MODEL MAP – use the exact name from AI analysis ────────────────────
 const MODEL_MAP = {
   "claude-fable-5": "anthropic-sonnet-3.5-stable",
   "fable-5": "anthropic-sonnet-3.5-stable",
@@ -65,6 +64,71 @@ function getNextNotionToken() {
   const token = NOTION_TOKENS[currentTokenIndex];
   currentTokenIndex = (currentTokenIndex + 1) % NOTION_TOKENS.length;
   return token;
+}
+
+// ── FETCH A REAL PAGE ID FROM THE SPACE ──────────────────────────────
+
+async function getFirstPageId(rawToken, spaceId, userId, proxyUrl) {
+  const cookie = `token_v2=${rawToken}`;
+  let agent;
+  if (proxyUrl) {
+    if (proxyUrl.startsWith('socks')) {
+      const Agent = await loadSPA();
+      agent = new Agent(proxyUrl);
+    } else {
+      const Agent = await loadHSPA();
+      agent = new Agent(proxyUrl);
+    }
+  }
+
+  // Query the space to get a page ID (use the search endpoint or load the space)
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({
+      query: "",
+      spaceId: spaceId,
+      limit: 1
+    });
+
+    const req = https.request({
+      hostname: 'www.notion.so',
+      port: 443,
+      path: '/api/v3/search',
+      method: 'POST',
+      agent,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+        'Cookie': cookie,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Origin': 'https://www.notion.so',
+        'Referer': 'https://www.notion.so/',
+        'x-notion-active-user-header': userId,
+        'x-notion-space-id': spaceId
+      }
+    }, res => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          // Look for the first page in the results
+          if (json.results && json.results.length > 0) {
+            const first = json.results[0];
+            if (first.id) {
+              console.log(`[PROXY] Using pageId: ${first.id}`);
+              return resolve(first.id);
+            }
+          }
+        } catch (e) {}
+        // Fallback: generate a random UUID (may not work)
+        console.warn('[PROXY] Could not find a real page; using random UUID. Might fail.');
+        resolve(crypto.randomUUID());
+      });
+    });
+    req.on('error', () => resolve(crypto.randomUUID()));
+    req.write(postData);
+    req.end();
+  });
 }
 
 // ── WORKSPACE CREATOR ────────────────────────────────────────────────────
@@ -195,7 +259,7 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   });
 }
 
-// ── NOTION AI REQUEST – NEW PAYLOAD SCHEMA ─────────────────────────────
+// ── NOTION AI REQUEST – USING CORRECT SCHEMA ─────────────────────────
 
 async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
   const cookie = `token_v2=${rawToken}`;
@@ -273,7 +337,6 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
 }
 
 function packMessagesForNotion(messages) {
-  // Build a single prompt string (the AI expects transcript as a string)
   let promptText = "";
   for (const m of messages) {
     const role = (m.role || "").toUpperCase();
@@ -290,7 +353,7 @@ function packMessagesForNotion(messages) {
   return promptText.trim();
 }
 
-// ── PARSER (unchanged) ──────────────────────────────────────────────────
+// ── PARSER ──────────────────────────────────────────────────────────────
 
 function extractTextFromData(data) {
   if (data.text) return data.text;
@@ -396,24 +459,26 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // ── NEW PAYLOAD STRUCTURE ──────────────────────────────────────────
-    // We need a pageId – if not available, generate a random one (may fail)
-    // In the future, we could fetch a real page from the workspace
-    const pageId = crypto.randomUUID(); // placeholder
+    // ── Get a real pageId from the workspace ──────────────────────────
+    const pageId = await getFirstPageId(tokenCookie, accountInfo.spaceId, accountInfo.userId, proxyUrl);
 
+    // ── NEW CORRECT PAYLOAD ────────────────────────────────────────────
     const notionPayload = {
-      task: "inference",                // or "conversation" – adjust as needed
+      task: "inference",
       model: notionModel,
       context: {
         type: "transcript",
         pageId: pageId,
         spaceId: accountInfo.spaceId
       },
-      transcript: promptText,           // now a plain string
+      inferenceRequest: {
+        type: "transcript_prompt",
+        transcript: promptText
+      },
       traceId: crypto.randomUUID()
     };
 
-    console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId}`);
+    console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId} | Page: ${pageId}`);
     console.log('[DEBUG] Payload:', JSON.stringify(notionPayload, null, 2));
 
     const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
