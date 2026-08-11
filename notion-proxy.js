@@ -201,9 +201,9 @@ async function getNotionAccountInfo(rawToken, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT (ORIGINAL HEADERS ONLY) ──────────────────────────
+// ── HTTP PROXY TRANSPORT (ORIGINAL HEADERS + Accept & x-notion-space-id) ──
 
-async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
+async function fetchNotionAI(payload, rawToken, userId, proxyUrl, spaceId) {
   const cookie = `token_v2=${rawToken}`;
   let agent;
   if (proxyUrl) {
@@ -227,12 +227,14 @@ async function fetchNotionAI(payload, rawToken, userId, proxyUrl) {
       agent,
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'application/x-ndjson',          // Required for NDJSON stream
         'Content-Length': Buffer.byteLength(postData),
         'Cookie': cookie,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
-        'x-notion-active-user-header': userId
+        'x-notion-active-user-header': userId,
+        'x-notion-space-id': spaceId               // Required to identify workspace
       }
     }, res => {
       resolve(res);
@@ -378,7 +380,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       accountCache.set(tokenCookie, accountInfo);
     }
 
-    // ── ORIGINAL PAYLOAD STRUCTURE ──────────────────────────────────────
+    // ── ORIGINAL PAYLOAD STRUCTURE (no threadId/createThread) ────────────
     const notionPayload = {
       traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
@@ -411,8 +413,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     };
 
     console.log(`[REQUEST] Model: ${requestedModel} → ${notionModel} | Space: ${accountInfo.spaceId}`);
+    console.log(`[DEBUG] Full payload:`, JSON.stringify(notionPayload, null, 2));
 
-    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl);
+    // Pass spaceId to fetchNotionAI
+    const notionRes = await fetchNotionAI(notionPayload, tokenCookie, accountInfo.userId, proxyUrl, accountInfo.spaceId);
+
+    console.log(`[DEBUG] Notion response status: ${notionRes.statusCode}`);
 
     if (notionRes.statusCode >= 400) {
       let body = '';
