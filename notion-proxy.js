@@ -44,20 +44,30 @@ function loadTokens() {
   if (fs.existsSync(TOKENS_FILE)) {
     try {
       const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
-      NOTION_TOKENS = raw.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+      const lines = raw.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.cookieString) {
+            NOTION_TOKENS.push(parsed);
+            continue;
+          }
+        } catch {}
+        NOTION_TOKENS.push({ cookieString: line });
+      }
       console.log(`[TOKENS] Loaded ${NOTION_TOKENS.length} account cookie sets.`);
     } catch {}
   }
 }
 
-function getNextCookieSession() {
+function getNextAccount() {
   if (!NOTION_TOKENS.length) {
     loadTokens();
     if (!NOTION_TOKENS.length) throw new Error("No Notion tokens available in pool.");
   }
-  const cookieSession = NOTION_TOKENS.shift(); // rotate tokens
-  NOTION_TOKENS.push(cookieSession);
-  return cookieSession;
+  const acc = NOTION_TOKENS.shift();
+  NOTION_TOKENS.push(acc);
+  return acc;
 }
 
 const MODEL_MAP = {
@@ -67,9 +77,20 @@ const MODEL_MAP = {
   "default": "olive-jellyroll"
 };
 
-// ── RESOLVE USER & SPACE ID FROM FULL COOKIE ───────────────────────────────
+// ── BULLETPROOF ACCOUNT RESOLVER ───────────────────────────────────────────
 
-async function getNotionAccountInfo(cookieString, proxyUrl) {
+async function getNotionAccountInfo(accountObj, proxyUrl) {
+  // Direct Fast-Path: Use pre-resolved IDs from autogen
+  if (accountObj.userId && accountObj.spaceId) {
+    return { userId: accountObj.userId, spaceId: accountObj.spaceId };
+  }
+
+  const cookieString = accountObj.cookieString || accountObj;
+  
+  let userId = null;
+  const userMatch = cookieString.match(/notion_user_id=([0-9a-f-]{36})/i);
+  if (userMatch) userId = userMatch[1];
+
   const agent = await getProxyAgent(proxyUrl);
 
   return new Promise((resolve, reject) => {
@@ -93,27 +114,35 @@ async function getNotionAccountInfo(cookieString, proxyUrl) {
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
         try {
+          const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
           const json = JSON.parse(body);
-          let userId = null;
+          
           let spaceId = null;
-
           const rootKeys = Object.keys(json);
           if (rootKeys.length > 0) {
             const firstKey = rootKeys[0];
+            if (!userId) userId = firstKey;
             const userData = json[firstKey];
+            if (userData && userData.space) {
+              const sKeys = Object.keys(userData.space);
+              if (sKeys.length > 0) spaceId = sKeys[0];
+            }
+          }
 
-            if (userData) {
-              userId = userData.notion_user ? Object.keys(userData.notion_user)[0] : firstKey;
-              if (userData.space) {
-                const sKeys = Object.keys(userData.space);
-                if (sKeys.length > 0) spaceId = sKeys[0];
+          if (!spaceId) {
+            const matches = body.match(uuidRegex) || [];
+            const unique = [...new Set(matches)];
+            for (const uuid of unique) {
+              if (uuid !== userId) {
+                spaceId = uuid;
+                break;
               }
             }
           }
 
           if (userId && spaceId) {
-            console.log(`[RESOLVED] User: ${userId} | Space: ${spaceId}`);
-            return resolve({ spaceId, userId });
+            console.log(`[RESOLVED FALLBACK] User: ${userId} | Space: ${spaceId}`);
+            return resolve({ userId, spaceId });
           }
           reject(new Error("Could not resolve workspace IDs."));
         } catch (e) {
@@ -171,13 +200,13 @@ app.post('/v1/chat/completions', async (req, res) => {
   const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || MODEL_MAP["default"];
 
   const promptText = (req.body.messages || []).map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n');
-  const cookieSession = getNextCookieSession();
+  const accountObj = getNextAccount();
 
   try {
-    let accountInfo = accountCache.get(cookieSession);
+    let accountInfo = accountCache.get(accountObj.cookieString);
     if (!accountInfo) {
-      accountInfo = await getNotionAccountInfo(cookieSession);
-      accountCache.set(cookieSession, accountInfo);
+      accountInfo = await getNotionAccountInfo(accountObj);
+      accountCache.set(accountObj.cookieString, accountInfo);
     }
 
     const notionPayload = {
@@ -197,7 +226,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     console.log(`[REQUEST] Model: ${notionModel} | User: ${accountInfo.userId}`);
 
-    const notionRes = await fetchNotionAI(notionPayload, cookieSession, accountInfo.userId, accountInfo.spaceId);
+    const notionRes = await fetchNotionAI(notionPayload, accountObj.cookieString, accountInfo.userId, accountInfo.spaceId);
 
     if (notionRes.statusCode >= 400) {
       let body = '';
