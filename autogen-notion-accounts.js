@@ -293,7 +293,7 @@ async function waitForNotionCode(authToken, proxy) {
   throw new Error('Verification code timed out');
 }
 
-// ── Notion Account Creation ─────────────────────────────────────────────────
+// ── Notion Account Creation (Fixed Auth Flow) ──────────────────────────────
 async function createAccountWithWorkspace(proxy) {
   const { email, authToken } = await createTempMailbox(proxy);
   console.log(`[1/5] Temp Email Created: ${email} (via ${proxy || 'Direct'})`);
@@ -325,7 +325,10 @@ async function createAccountWithWorkspace(proxy) {
     await page.keyboard.type(code, { delay: 30 });
     await page.keyboard.press('Enter');
 
-    console.log(`[4/5] Code submitted. Initializing workspace setup...`);
+    console.log(`[4/5] Code submitted. Waiting for authentication navigation...`);
+
+    // FIX: Wait for navigation so Notion sets token_v2
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
 
     let verification = null;
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -367,10 +370,16 @@ async function createAccountWithWorkspace(proxy) {
 
     if (!verification || !verification.success) throw new Error('Workspace creation failed');
 
-    const rawCookies = await page.cookies('https://www.notion.so', 'https://app.notion.so');
+    // FIX: Verify token_v2 exists in cookies
+    const rawCookies = await page.cookies();
+    const hasTokenV2 = rawCookies.some(c => c.name === 'token_v2');
+    if (!hasTokenV2) {
+      throw new Error('Authentication failed: token_v2 cookie was not issued');
+    }
+
     const fullCookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    console.log(`[5/5] SUCCESS! Space ID: ${verification.spaceId} | User ID: ${verification.userId}`);
+    console.log(`[5/5] SUCCESS! Session authenticated with Space ID: ${verification.spaceId}`);
     await browser.close();
 
     return {
@@ -422,7 +431,6 @@ async function fillPool() {
       const acc = await createAccountWithWorkspace(proxy);
       pool.push({ ...acc, proxy, createdAt: Date.now() });
       
-      // Save structured JSON line to notion-tokens.txt
       const recordLine = JSON.stringify({
         cookieString: acc.cookieString,
         userId: acc.userId,
