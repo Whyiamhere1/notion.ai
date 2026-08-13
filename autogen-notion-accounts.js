@@ -7,9 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const fsPromises = fs.promises;
 const path = require('path');
-const { SocksClient } = require('socks');
 
-// Dynamic proxy agent loaders (same as use.ai)
 let _SPA, _HPA, _HSPA;
 async function loadSPA() {
   if (!_SPA) { const m = await import('socks-proxy-agent'); _SPA = m.SocksProxyAgent; }
@@ -32,19 +30,17 @@ const POOL_STATE_FILE = path.join(__dirname, 'notion-pool.json');
 const PROXIES_FILE = path.join(__dirname, 'proxies.txt');
 const PROXY_HEALTH_FILE = path.join(__dirname, 'notion-proxy-health.json');
 
-const TARGET_POOL_SIZE = 20;          // desired number of ready tokens
-const MIN_POOL_SIZE = 8;              // refill threshold
-const MAX_CONCURRENT_FILLS = 3;       // background fills
-const BATCH_SIZE = 5;                 // accounts per fill batch
-const DELAY_BETWEEN_ACCOUNTS = 10_000; // 10s between creations (per proxy)
+const TARGET_POOL_SIZE = 20;
+const MIN_POOL_SIZE = 8;
+const MAX_CONCURRENT_FILLS = 3;
+const BATCH_SIZE = 5;
 const PROXY_REFRESH_MS = 15 * 60 * 1000;
 
 const PROXIFLY_URL = 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt';
 const PROXYSCRAPE_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=5000&status=alive';
 
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) Gecko/20100101 Firefox/154.0';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// ── Proxy Management (adapted from use.ai) ─────────────────────────────────
 let cachedProxies = [];
 let proxiesLoaded = false;
 let refreshRunning = false;
@@ -75,10 +71,6 @@ function loadProxies() {
 function getHealth(proxy) {
   let h = proxyHealth.get(proxy);
   if (!h) {
-    if (proxyHealth.size >= 1000) {
-      const oldestKey = proxyHealth.keys().next().value;
-      if (oldestKey) proxyHealth.delete(oldestKey);
-    }
     h = { ok: 0, fail: 0, lastOk: 0, blocked: false, coolingUntil: 0, inUse: 0 };
     proxyHealth.set(proxy, h);
   }
@@ -247,7 +239,6 @@ function pickProxy() {
   return cachedProxies[Math.floor(Math.random() * cachedProxies.length)];
 }
 
-// ── HTTP with proxy (for API calls) ────────────────────────────────────────
 async function fetchWithProxy(url, options = {}, proxy) {
   let agent;
   if (proxy) {
@@ -291,7 +282,7 @@ async function fetchWithProxy(url, options = {}, proxy) {
   });
 }
 
-// ── Mail.tm API (with proxy) ───────────────────────────────────────────────
+// ── Mail.tm API ─────────────────────────────────────────────────────────────
 async function requestJSON(url, options = {}, bodyData = null, proxy = null) {
   const headers = { 'User-Agent': USER_AGENT, ...(options.headers || {}) };
   let bodyString = bodyData ? JSON.stringify(bodyData) : null;
@@ -337,12 +328,11 @@ async function waitForNotionCode(authToken, proxy) {
   throw new Error('Verification code timed out');
 }
 
-// ── Notion Account Creation (with proxy) ──────────────────────────────────
+// ── Notion Account Creation (AUTOMATIC FULL COOKIE EXTRACTION) ──────────────
 async function createAccountWithWorkspace(proxy) {
   const { email, authToken } = await createTempMailbox(proxy);
-  console.log(`[1/5] Temp Email Created: ${email} (via ${proxy})`);
+  console.log(`[1/5] Temp Email Created: ${email} (via ${proxy || 'Direct'})`);
 
-  // Configure Puppeteer with proxy
   const browserArgs = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -350,15 +340,9 @@ async function createAccountWithWorkspace(proxy) {
     '--headless=new',
     '--window-size=1280,800'
   ];
-  if (proxy) {
-    browserArgs.push(`--proxy-server=${proxy}`);
-  }
+  if (proxy) browserArgs.push(`--proxy-server=${proxy}`);
 
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: browserArgs
-  });
-
+  const browser = await puppeteer.launch({ headless: 'new', args: browserArgs });
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
@@ -376,82 +360,68 @@ async function createAccountWithWorkspace(proxy) {
     await page.keyboard.type(code, { delay: 30 });
     await page.keyboard.press('Enter');
 
-    console.log(`[4/5] Code submitted. Initializing API-driven onboarding bypass...`);
+    console.log(`[4/5] Code submitted. Initializing workspace setup...`);
 
     let verification = null;
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     for (let attempt = 1; attempt <= 15; attempt++) {
       await new Promise(r => setTimeout(r, 2000));
-      const url = page.url();
-      console.log(`[BOT] Current URL: ${url} (Attempt ${attempt}/15)`);
 
       verification = await page.evaluate(async () => {
         try {
           const spacesRes = await fetch('/api/v3/getSpaces', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-          if (!spacesRes.ok) {
-            return { success: false, reason: `getSpaces responded with status ${spacesRes.status}` };
-          }
+          if (!spacesRes.ok) return { success: false, reason: `getSpaces status ${spacesRes.status}` };
+          
           const spacesData = await spacesRes.json();
           const userId = spacesData.notion_user ? Object.keys(spacesData.notion_user)[0] : null;
           let spaceId = spacesData.space ? Object.keys(spacesData.space)[0] : null;
 
-          if (!userId || !uuidRegex.test(userId)) {
-            return { success: false, reason: 'Waiting for valid user session...' };
-          }
-          if (spaceId && uuidRegex.test(spaceId)) {
-            return { success: true, spaceId: spaceId, userId: userId };
-          }
+          if (!userId || !uuidRegex.test(userId)) return { success: false, reason: 'Waiting for valid user session...' };
+          if (spaceId && uuidRegex.test(spaceId)) return { success: true, spaceId, userId };
 
           const createRes = await fetch('/api/v3/createSpace', {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-notion-active-user-header': userId },
             body: JSON.stringify({ name: "My Workspace", planType: "personal" })
           });
-          if (createRes.status === 429) {
-            return { success: false, reason: 'Rate limited (429) by Notion' };
-          }
-          if (!createRes.ok) {
-            return { success: false, reason: `createSpace responded with status ${createRes.status}` };
-          }
+          if (!createRes.ok) return { success: false, reason: `createSpace status ${createRes.status}` };
+
           const createData = await createRes.json();
           const newSpaceId = createData.spaceId || (createData.recordMap?.space ? Object.keys(createData.recordMap.space)[0] : null);
-          if (newSpaceId && uuidRegex.test(newSpaceId)) {
-            return { success: true, spaceId: newSpaceId, userId: userId };
-          }
-          return { success: false, reason: 'Failed to extract spaceId from createSpace response' };
+          if (newSpaceId && uuidRegex.test(newSpaceId)) return { success: true, spaceId: newSpaceId, userId };
+          
+          return { success: false, reason: 'Failed to extract spaceId' };
         } catch (err) {
           return { success: false, reason: err.message };
         }
       });
 
-      if (verification && verification.success) {
-        console.log(`[BOT] Workspace successfully verified/created via backend API: Space ID ${verification.spaceId}`);
-        break;
-      } else {
-        console.log(`[BOT] Pending workspace resolution: ${verification ? verification.reason : 'No response'}`);
-      }
+      if (verification && verification.success) break;
     }
 
-    if (!verification || !verification.success) {
-      throw new Error(`Workspace bypass failed: ${verification ? verification.reason : 'Timeout'}`);
-    }
+    if (!verification || !verification.success) throw new Error('Workspace creation failed');
 
-    const cookies = await page.cookies();
-    const tokenCookie = cookies.find(c => c.name === 'token_v2');
-    if (!tokenCookie) throw new Error('token_v2 cookie not found');
+    // FIXED: EXTRACT THE FULL COOKIE JAR FROM PUPPETEER
+    const rawCookies = await page.cookies('https://www.notion.so', 'https://app.notion.so');
+    const fullCookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    const cleanToken = decodeURIComponent(tokenCookie.value);
-    console.log(`[5/5] SUCCESS! Token verified with Space ID: ${verification.spaceId}`);
+    console.log(`[5/5] SUCCESS! Extracted full session cookies for Space ID: ${verification.spaceId}`);
     await browser.close();
-    return cleanToken;
+
+    return {
+      cookieString: fullCookieString,
+      userId: verification.userId,
+      spaceId: verification.spaceId
+    };
+
   } catch (err) {
     try { await browser.close(); } catch {}
     throw err;
   }
 }
 
-// ── Account Pool (Notion tokens) ────────────────────────────────────────────
+// ── Account Pool Management ────────────────────────────────────────────────
 let pool = [];
 let fillInProgress = 0;
 let fillPromise = null;
@@ -459,7 +429,6 @@ let warmed = false;
 let fillStats = { attempts: 0, successes: 0, failures: 0 };
 
 function persistPoolAsync() {
-  // Debounced writing to file
   if (persistPoolAsync.timer) return;
   persistPoolAsync.timer = setTimeout(async () => {
     persistPoolAsync.timer = null;
@@ -481,62 +450,39 @@ async function fillPool() {
   if (fillInProgress >= MAX_CONCURRENT_FILLS) return;
   const room = TARGET_POOL_SIZE - pool.length;
   if (room <= 0) return;
-  const threads = Math.min(MAX_CONCURRENT_FILLS - fillInProgress, Math.ceil(room / BATCH_SIZE));
-  const promises = [];
-  for (let t = 0; t < threads; t++) {
-    fillInProgress++;
-    const p = (async () => {
-      try {
-        const count = Math.min(BATCH_SIZE, TARGET_POOL_SIZE - pool.length);
-        if (count <= 0) return;
-        const inFlight = Array.from({ length: count }, async () => {
-          fillStats.attempts++;
-          const proxy = pickProxy();
-          if (!proxy) {
-            fillStats.failures++;
-            throw new Error('No proxy available');
-          }
-          acquireProxy(proxy);
-          try {
-            const token = await createAccountWithWorkspace(proxy);
-            pool.push({ token, proxy, createdAt: Date.now() });
-            fs.appendFileSync(TOKENS_FILE, token + '\n', 'utf-8');
-            fillStats.successes++;
-            recordProxyResult(proxy, true);
-            persistPoolAsync();
-          } catch (e) {
-            fillStats.failures++;
-            const msg = e?.message || String(e);
-            if (msg.includes('429')) cooldownProxy(proxy, 2 * 60_000);
-            else if (msg.includes('403')) markProxyBlocked(proxy);
-            else recordProxyResult(proxy, false);
-            throw e;
-          } finally {
-            releaseProxy(proxy);
-          }
-        });
-        await Promise.allSettled(inFlight);
-      } finally {
-        fillInProgress--;
-        if (fillInProgress === 0) fillPromise = null;
-      }
-    })();
-    promises.push(p);
+
+  fillInProgress++;
+  try {
+    const proxy = pickProxy();
+    if (proxy) acquireProxy(proxy);
+    try {
+      const acc = await createAccountWithWorkspace(proxy);
+      pool.push({ ...acc, proxy, createdAt: Date.now() });
+      
+      // Save full cookie string into notion-tokens.txt
+      fs.appendFileSync(TOKENS_FILE, acc.cookieString + '\n', 'utf-8');
+      
+      fillStats.successes++;
+      if (proxy) recordProxyResult(proxy, true);
+      persistPoolAsync();
+    } catch (e) {
+      fillStats.failures++;
+      if (proxy) recordProxyResult(proxy, false);
+    } finally {
+      if (proxy) releaseProxy(proxy);
+    }
+  } finally {
+    fillInProgress--;
   }
-  fillPromise = Promise.all(promises);
-  await fillPromise;
 }
 
 function grabToken() {
-  if (pool.length < MIN_POOL_SIZE && fillInProgress === 0) {
-    fillPool().catch(() => {});
-  }
+  if (pool.length < MIN_POOL_SIZE && fillInProgress === 0) fillPool().catch(() => {});
   if (pool.length > 0) {
     const item = pool.pop();
     persistPoolAsync();
-    return item.token;
+    return item.cookieString;
   }
-  // Fallback: create on demand
   return null;
 }
 
@@ -544,52 +490,28 @@ function warmPool() {
   if (warmed) return;
   warmed = true;
   loadProxies();
-  (async () => {
-    for (let i = 0; i < 5; i++) {
-      await refreshProxies().catch(() => {});
-      if (provenProxies.length >= 3) break;
-    }
-    fillPool().catch(() => {});
-  })();
-
-  const t1 = setInterval(() => refreshProxies().catch(() => {}), PROXY_REFRESH_MS);
-  const t2 = setInterval(() => {
-    if (pool.length < MIN_POOL_SIZE && fillInProgress === 0) {
-      fillPool().catch(() => {});
-    }
+  fillPool().catch(() => {});
+  setInterval(() => {
+    if (pool.length < MIN_POOL_SIZE && fillInProgress === 0) fillPool().catch(() => {});
   }, 60_000);
-  if (t1.unref) t1.unref();
-  if (t2.unref) t2.unref();
 }
 
-// ── Main startup ───────────────────────────────────────────────────────────
 loadPool();
 loadProxyHealth();
 warmPool();
 
-// Example usage: Get a token from pool or create one on demand
 async function getNotionToken() {
-  let token = grabToken();
-  if (!token) {
+  let cookieString = grabToken();
+  if (!cookieString) {
     const proxy = pickProxy();
-    if (!proxy) throw new Error('No proxy available');
-    acquireProxy(proxy);
-    try {
-      token = await createAccountWithWorkspace(proxy);
-      pool.push({ token, proxy, createdAt: Date.now() });
-      persistPoolAsync();
-      recordProxyResult(proxy, true);
-    } catch (e) {
-      recordProxyResult(proxy, false);
-      throw e;
-    } finally {
-      releaseProxy(proxy);
-    }
+    const acc = await createAccountWithWorkspace(proxy);
+    cookieString = acc.cookieString;
+    pool.push({ ...acc, proxy, createdAt: Date.now() });
+    persistPoolAsync();
   }
-  return token;
+  return cookieString;
 }
 
-// Keep running in background (if you want the script to stay alive for pooling)
-setInterval(() => {}, 1 << 30); // Prevent exit
+setInterval(() => {}, 1 << 30);
 
 module.exports = { getNotionToken, getPoolStats: () => ({ pool: pool.length, stats: fillStats }) };
