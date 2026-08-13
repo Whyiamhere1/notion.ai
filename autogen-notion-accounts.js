@@ -162,14 +162,14 @@ async function waitForNotionCode(authToken, proxy) {
       if (match) return match[0];
     }
   }
-  throw new Error('Code timeout');
+  throw new Error('Verification code timed out');
 }
 
-// ── ACCOUNT CREATOR WITH STRICT UUID VALIDATION ────────────────────────────
+// ── AUTHENTICATED ACCOUNT CREATOR ──────────────────────────────────────────
 
 async function createAccountWithWorkspace(proxy) {
   const { email, authToken } = await createTempMailbox(proxy);
-  console.log(`[1/5] Temp Email: ${email}`);
+  console.log(`[1/5] Temp Email Created: ${email}`);
 
   const browserArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--headless=new'];
   if (proxy) browserArgs.push(`--proxy-server=${proxy}`);
@@ -187,63 +187,101 @@ async function createAccountWithWorkspace(proxy) {
     const code = await waitForNotionCode(authToken, proxy);
     console.log(`[3/5] Received Code: ${code}`);
 
-    await page.waitForSelector('input[placeholder*="code"]', { timeout: 15000 }).catch(() => {});
-    await page.keyboard.type(code, { delay: 30 });
-    await page.keyboard.press('Enter');
+    const codeInput = await page.waitForSelector('input[placeholder*="code"], input[type="text"]', { timeout: 15000 });
+    await codeInput.type(code, { delay: 40 });
 
-    console.log(`[4/5] Submitted code. Navigating to workspace...`);
+    // Click submit/continue button in UI
+    const submitBtn = await page.evaluateHandle(() => {
+      const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+      return btns.find(b => {
+        const txt = (b.textContent || '').toLowerCase();
+        return txt.includes('continue') || txt.includes('login') || txt.includes('submit');
+      });
+    });
 
-    // Complete Onboarding Navigation
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+    if (submitBtn) {
+      await submitBtn.click();
+    } else {
+      await page.keyboard.press('Enter');
+    }
+
+    console.log(`[4/5] Submitted code. Verifying authentication token...`);
+
+    // VERIFY AUTHENTICATION: Wait until token_v2 exists in browser cookies
+    let authenticated = false;
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      const cookies = await page.cookies();
+      const tokenCookie = cookies.find(c => c.name === 'token_v2');
+      if (tokenCookie && tokenCookie.value) {
+        authenticated = true;
+        break;
+      }
+    }
+
+    if (!authenticated) {
+      throw new Error('Authentication failed: token_v2 was not issued after code submission.');
+    }
+
+    console.log(`[AUTH] token_v2 verified! Resolving workspace IDs...`);
+
+    // Navigate to workspace home page to complete onboarding
     await page.goto('https://www.notion.so/', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
 
     let verification = null;
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     for (let attempt = 1; attempt <= 15; attempt++) {
       await new Promise(r => setTimeout(r, 2000));
 
       verification = await page.evaluate(async () => {
         try {
-          const spacesRes = await fetch('/api/v3/getSpaces', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-          if (!spacesRes.ok) return { success: false, reason: `getSpaces responded ${spacesRes.status}` };
+          const spacesRes = await fetch('/api/v3/getSpaces', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}',
+            credentials: 'include'
+          });
+          if (!spacesRes.ok) return { success: false, reason: `getSpaces status ${spacesRes.status}` };
           
           const spacesData = await spacesRes.json();
-          if (spacesData.isNotionError) return { success: false, reason: 'Pending onboarding initialization...' };
+          if (spacesData.isNotionError) return { success: false, reason: 'Waiting for session initialization...' };
 
           let userId = null;
           let spaceId = null;
 
-          if (spacesData.notion_user) {
-            userId = Object.keys(spacesData.notion_user)[0];
-          } else {
-            const rootKeys = Object.keys(spacesData);
-            if (rootKeys.length > 0 && rootKeys[0] !== 'isNotionError') userId = rootKeys[0];
+          const rootKeys = Object.keys(spacesData);
+          for (const k of rootKeys) {
+            if (k === 'isNotionError') continue;
+            const userData = spacesData[k];
+            if (userData && typeof userData === 'object') {
+              if (!userId) userId = k;
+              if (userData.space) {
+                const sKeys = Object.keys(userData.space);
+                if (sKeys.length > 0) spaceId = sKeys[0];
+              }
+            }
           }
 
-          if (spacesData.space) {
-            spaceId = Object.keys(spacesData.space)[0];
-          }
+          const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (!userId || !uuidRegex.test(userId)) return { success: false, reason: 'Waiting for valid user UUID...' };
 
-          // Strict UUID check: Never accept "isNotionError"
-          const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-          if (!userId || !uuidPattern.test(userId)) return { success: false, reason: 'Waiting for valid user UUID...' };
+          if (spaceId && uuidRegex.test(spaceId)) return { success: true, spaceId, userId };
 
-          if (spaceId && uuidPattern.test(spaceId)) return { success: true, spaceId, userId };
-
-          // Create Personal Space via backend API
+          // Create Personal Space via in-page API
           const createRes = await fetch('/api/v3/createSpace', {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-notion-active-user-header': userId },
-            body: JSON.stringify({ name: "My Workspace", planType: "personal" })
+            body: JSON.stringify({ name: "My Workspace", planType: "personal" }),
+            credentials: 'include'
           });
           if (!createRes.ok) return { success: false, reason: 'createSpace failed' };
 
           const createData = await createRes.json();
           const newSpaceId = createData.spaceId || (createData.recordMap?.space ? Object.keys(createData.recordMap.space)[0] : null);
-          if (newSpaceId && uuidPattern.test(newSpaceId)) return { success: true, spaceId: newSpaceId, userId };
+          if (newSpaceId && uuidRegex.test(newSpaceId)) return { success: true, spaceId: newSpaceId, userId };
 
-          return { success: false, reason: 'Space creation pending...' };
+          return { success: false, reason: 'Space creation in progress...' };
         } catch (err) {
           return { success: false, reason: err.message };
         }
@@ -252,15 +290,12 @@ async function createAccountWithWorkspace(proxy) {
       if (verification && verification.success) break;
     }
 
-    if (!verification || !verification.success) throw new Error('Failed to resolve workspace IDs');
+    if (!verification || !verification.success) throw new Error('Failed to resolve workspace IDs.');
 
     const rawCookies = await page.cookies();
-    const tokenCookie = rawCookies.find(c => c.name === 'token_v2');
-    if (!tokenCookie) throw new Error('token_v2 was not issued');
-
     const fullCookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    console.log(`[5/5] SUCCESS! Space: ${verification.spaceId} | User: ${verification.userId}`);
+    console.log(`[5/5] SUCCESS! Space ID: ${verification.spaceId} | User ID: ${verification.userId}`);
     await browser.close();
 
     return {
@@ -335,7 +370,7 @@ loadPool();
 async function getNotionToken() {
   let acc = grabToken();
   if (!acc) {
-    console.log(`[AUTOGEN] Pool empty. Creating fresh account live...`);
+    console.log(`[AUTOGEN] Creating fresh authenticated account...`);
     const proxy = pickProxy();
     acc = await createAccountWithWorkspace(proxy);
     pool.push({ ...acc, proxy, createdAt: Date.now() });
