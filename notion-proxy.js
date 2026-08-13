@@ -106,7 +106,7 @@ async function getNextAccount() {
         console.error(`[AUTOGEN ERROR] Live account creation failed:`, err.message);
       }
     }
-    throw new Error("No Notion tokens available in pool. Please add a valid token to NOTION_TOKENS environment variable.");
+    throw new Error("No Notion tokens available in pool. Please set NOTION_TOKENS environment variable.");
   }
 
   const acc = NOTION_TOKENS.shift();
@@ -127,17 +127,16 @@ const MODEL_MAP = {
   "default": "olive-jellyroll"
 };
 
-// ── ROBUST ACCOUNT RESOLVER ────────────────────────────────────────────────
+// ── FAST-PATH ACCOUNT RESOLVER ─────────────────────────────────────────────
 
 async function getNotionAccountInfo(accountObj, proxyUrl) {
-  // FAST-PATH: Use pre-resolved IDs if present
+  // FAST-PATH: Use pre-resolved IDs directly without calling getSpaces
   if (accountObj.userId && accountObj.spaceId && accountObj.userId !== 'isNotionError') {
     return { userId: accountObj.userId, spaceId: accountObj.spaceId };
   }
 
   const cookieString = accountObj.cookieString || accountObj;
   
-  // Extract user ID directly from cookie if available
   let userId = null;
   const userMatch = cookieString.match(/notion_user_id=([0-9a-f-]{36})/i);
   if (userMatch) userId = userMatch[1];
@@ -158,7 +157,15 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
         'Cookie': cookieString,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.notion.so',
-        'Referer': 'https://www.notion.so/'
+        'Referer': 'https://www.notion.so/',
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.9',
+        'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin'
       }
     }, res => {
       let body = '';
@@ -167,13 +174,12 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
         try {
           if (res.statusCode >= 400) {
             console.error(`[GETSPACES ERROR ${res.statusCode}]`, body);
-            return reject(new Error(`Notion responded with HTTP ${res.statusCode}: ${body.slice(0, 100)}`));
+            return reject(new Error(`Notion HTTP ${res.statusCode}`));
           }
 
           const json = JSON.parse(body);
           let spaceId = null;
 
-          // Parse workspace from getSpaces response
           const rootKeys = Object.keys(json);
           for (const k of rootKeys) {
             if (k === 'isNotionError') continue;
@@ -187,7 +193,6 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
             }
           }
 
-          // Deep search fallback for space UUID
           if (!spaceId) {
             const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
             const matches = body.match(uuidRegex) || [];
@@ -203,8 +208,7 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
             return resolve({ userId, spaceId });
           }
 
-          console.error(`[GETSPACES RESPONSE]`, body);
-          reject(new Error("Could not resolve workspace IDs from Notion response. Token may be invalid or expired."));
+          reject(new Error("Could not resolve workspace IDs."));
         } catch (e) {
           reject(new Error(`Failed to parse getSpaces: ${e.message}`));
         }
@@ -234,6 +238,14 @@ async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Origin': 'https://www.notion.so',
     'Referer': 'https://www.notion.so/',
+    'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
     'x-notion-active-user-header': userId,
     'x-notion-space-id': spaceId,
     'x-notion-client-version': '23.13.20260313.1423'
