@@ -15,7 +15,7 @@ try {
   try {
     autogen = require('./autogen.js');
   } catch (e2) {
-    console.warn('[WARNING] autogen module not found. Running in standalone proxy mode.');
+    console.warn('[WARNING] autogen module not found. Proxy will rely strictly on notion-tokens.txt.');
   }
 }
 
@@ -63,6 +63,7 @@ function parseAccountLine(line) {
 function loadTokens() {
   NOTION_TOKENS = [];
 
+  // 1. Environment Variable (Render)
   if (process.env.NOTION_TOKENS) {
     const rawEnv = process.env.NOTION_TOKENS.split(/[\r\n]+/);
     for (const line of rawEnv) {
@@ -71,6 +72,7 @@ function loadTokens() {
     }
   }
 
+  // 2. Local file
   if (!NOTION_TOKENS.length && fs.existsSync(TOKENS_FILE)) {
     try {
       const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
@@ -104,7 +106,7 @@ async function getNextAccount() {
         console.error(`[AUTOGEN ERROR] Live account creation failed:`, err.message);
       }
     }
-    throw new Error("No Notion tokens available in pool. Please set NOTION_TOKENS environment variable.");
+    throw new Error("No Notion tokens available in pool.");
   }
 
   const acc = NOTION_TOKENS.shift();
@@ -125,10 +127,10 @@ const MODEL_MAP = {
   "default": "olive-jellyroll"
 };
 
-// ── FAST-PATH ACCOUNT RESOLVER ─────────────────────────────────────────────
+// ── FIXED ACCOUNT RESOLVER WITH BEARER AUTH ─────────────────────────────────
 
 async function getNotionAccountInfo(accountObj, proxyUrl) {
-  // FAST-PATH: If userId and spaceId are pre-resolved, bypass getSpaces completely
+  // FAST-PATH: Use pre-resolved IDs directly without calling getSpaces
   if (accountObj.userId && accountObj.spaceId && accountObj.userId !== 'isNotionError') {
     return { userId: accountObj.userId, spaceId: accountObj.spaceId };
   }
@@ -139,33 +141,49 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
   const userMatch = cookieString.match(/notion_user_id=([0-9a-f-]{36})/i);
   if (userMatch) userId = userMatch[1];
 
+  const tokenMatch = cookieString.match(/token_v2=([^;]+)/i);
+  let rawToken = tokenMatch ? tokenMatch[1] : (typeof accountObj === 'string' ? accountObj : '');
+  try { rawToken = decodeURIComponent(rawToken); } catch {}
+
   const agent = await getProxyAgent(proxyUrl);
 
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Origin': 'https://www.notion.so',
+    'Referer': 'https://www.notion.so/',
+    'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'x-notion-active-user-header': userId || ''
+  };
+
+  if (cookieString.includes('=')) {
+    headers['Cookie'] = cookieString;
+  } else {
+    headers['Cookie'] = `token_v2=${rawToken}`;
+  }
+
+  if (rawToken) {
+    headers['Authorization'] = `Bearer ${rawToken}`;
+  }
+
+  const postData = JSON.stringify({});
+  headers['Content-Length'] = Buffer.byteLength(postData);
+
   return new Promise((resolve, reject) => {
-    const postData = JSON.stringify({});
     const req = https.request({
       hostname: 'www.notion.so',
       port: 443,
       path: '/api/v3/getSpaces',
       method: 'POST',
       agent,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-        'Cookie': cookieString,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Origin': 'https://www.notion.so',
-        'Referer': 'https://www.notion.so/',
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9',
-        'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'x-notion-active-user-header': userId || ''
-      }
+      headers
     }, res => {
       let body = '';
       res.on('data', chunk => body += chunk);
@@ -220,20 +238,19 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT WITH BROWSER HEADERS ───────────────────────────────
+// ── HTTP PROXY TRANSPORT ────────────────────────────────────────────────────
 
 async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
   const agent = await getProxyAgent(proxyUrl);
   const postData = JSON.stringify(payload);
 
   const tokenMatch = cookieString.match(/token_v2=([^;]+)/i);
-  let rawToken = tokenMatch ? tokenMatch[1] : '';
+  let rawToken = tokenMatch ? tokenMatch[1] : (typeof cookieString === 'string' ? cookieString : '');
   try { rawToken = decodeURIComponent(rawToken); } catch {}
 
   const headers = {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(postData),
-    'Cookie': cookieString,
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Origin': 'https://www.notion.so',
     'Referer': 'https://www.notion.so/',
@@ -249,6 +266,12 @@ async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
     'x-notion-space-id': spaceId,
     'x-notion-client-version': '23.13.20260313.1423'
   };
+
+  if (cookieString.includes('=')) {
+    headers['Cookie'] = cookieString;
+  } else {
+    headers['Cookie'] = `token_v2=${rawToken}`;
+  }
 
   if (rawToken) {
     headers['Authorization'] = `Bearer ${rawToken}`;
@@ -273,7 +296,7 @@ async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
   });
 }
 
-// ── OPENAI COMPATIBLE ROUTES ─────────────────────────────────────────────────
+// ── OPENAI COMPATIBLE ROUTES WITH RETRY AUTOMATION ──────────────────────────
 
 app.get('/v1/models', (req, res) => {
   res.json({
@@ -288,87 +311,97 @@ app.post('/v1/chat/completions', async (req, res) => {
   const notionModel = MODEL_MAP[requestedModel.toLowerCase()] || MODEL_MAP["default"];
 
   const promptText = (req.body.messages || []).map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n');
-  
-  let accountObj;
-  try {
-    accountObj = await getNextAccount();
-  } catch (e) {
-    return res.status(500).json({ error: { message: e.message, type: "no_tokens_available" } });
-  }
 
-  try {
-    let accountInfo = accountCache.get(accountObj.cookieString);
-    if (!accountInfo) {
-      accountInfo = await getNotionAccountInfo(accountObj);
-      accountCache.set(accountObj.cookieString, accountInfo);
+  let attempts = 0;
+  while (attempts < 3) {
+    attempts++;
+    let accountObj;
+    try {
+      accountObj = await getNextAccount();
+    } catch (e) {
+      return res.status(500).json({ error: { message: e.message, type: "no_tokens_available" } });
     }
 
-    const notionPayload = {
-      taskType: "workflow",
-      traceId: crypto.randomUUID(),
-      spaceId: accountInfo.spaceId,
-      threadId: crypto.randomUUID(),
-      createThread: true,
-      isPartialTranscript: true,
-      asPatchResponse: true,
-      transcript: [
-        { id: crypto.randomUUID(), type: "config", value: { type: "thread", model: notionModel, useWebSearch: true } },
-        { id: crypto.randomUUID(), type: "context", value: { userName: "User", surface: "workflows" } },
-        { id: crypto.randomUUID(), type: "user", value: [[ promptText ]], userId: accountInfo.userId, createdAt: new Date().toISOString() }
-      ]
-    };
-
-    console.log(`[REQUEST] Model: ${notionModel} | User: ${accountInfo.userId}`);
-
-    const notionRes = await fetchNotionAI(notionPayload, accountObj.cookieString, accountInfo.userId, accountInfo.spaceId);
-
-    if (notionRes.statusCode === 401) {
-      console.error(`[401 UNAUTHORIZED] Expired session. Purging token.`);
-      purgeAccount(accountObj.cookieString);
-      if (!res.headersSent) {
-        return res.status(401).json({ error: { message: "Account unauthorized. Token purged.", type: "notion_unauthorized" } });
+    try {
+      let accountInfo = accountCache.get(accountObj.cookieString);
+      if (!accountInfo) {
+        accountInfo = await getNotionAccountInfo(accountObj);
+        accountCache.set(accountObj.cookieString, accountInfo);
       }
-      return;
-    }
 
-    if (notionRes.statusCode >= 400) {
-      let body = '';
-      notionRes.on('data', d => body += d);
-      notionRes.on('end', () => {
-        if (!res.headersSent) {
-          res.status(notionRes.statusCode).json({ error: `Notion Error ${notionRes.statusCode}`, details: body });
+      const notionPayload = {
+        taskType: "workflow",
+        traceId: crypto.randomUUID(),
+        spaceId: accountInfo.spaceId,
+        threadId: crypto.randomUUID(),
+        createThread: true,
+        isPartialTranscript: true,
+        asPatchResponse: true,
+        transcript: [
+          { id: crypto.randomUUID(), type: "config", value: { type: "thread", model: notionModel, useWebSearch: true } },
+          { id: crypto.randomUUID(), type: "context", value: { userName: "User", surface: "workflows" } },
+          { id: crypto.randomUUID(), type: "user", value: [[ promptText ]], userId: accountInfo.userId, createdAt: new Date().toISOString() }
+        ]
+      };
+
+      console.log(`[REQUEST] Model: ${notionModel} | User: ${accountInfo.userId}`);
+
+      const notionRes = await fetchNotionAI(notionPayload, accountObj.cookieString, accountInfo.userId, accountInfo.spaceId);
+
+      if (notionRes.statusCode === 401) {
+        console.error(`[401 UNAUTHORIZED] Expired session. Purging token and retrying...`);
+        purgeAccount(accountObj.cookieString);
+        continue; // Auto-retry with next available token
+      }
+
+      if (notionRes.statusCode >= 400) {
+        let body = '';
+        notionRes.on('data', d => body += d);
+        notionRes.on('end', () => {
+          if (!res.headersSent) {
+            res.status(notionRes.statusCode).json({ error: `Notion Error ${notionRes.statusCode}`, details: body });
+          }
+        });
+        return;
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
+
+      notionRes.on('data', chunk => {
+        const lines = chunk.toString().split('\n').filter(Boolean);
+        for (const line of lines) {
+          try {
+            const parsed = JSON.parse(line);
+            const textChunk = parsed.text || parsed.delta || (parsed.type === 'text' ? parsed.text : '');
+            if (textChunk) {
+              res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
+            }
+          } catch {}
         }
       });
-      return;
-    }
 
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+      notionRes.on('end', () => {
+        res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
 
-    res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })}\n\n`);
+      return; // Success!
 
-    notionRes.on('data', chunk => {
-      const lines = chunk.toString().split('\n').filter(Boolean);
-      for (const line of lines) {
-        try {
-          const parsed = JSON.parse(line);
-          const textChunk = parsed.text || parsed.delta || (parsed.type === 'text' ? parsed.text : '');
-          if (textChunk) {
-            res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: { content: textChunk } }] })}\n\n`);
-          }
-        } catch {}
+    } catch (err) {
+      console.error(`[ACCOUNT RESOLVE ERROR]`, err.message);
+      if (accountObj && accountObj.cookieString) {
+        purgeAccount(accountObj.cookieString);
       }
-    });
+    }
+  }
 
-    notionRes.on('end', () => {
-      res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    });
-
-  } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: { message: err.message, type: 'notion_proxy_error' } });
+  if (!res.headersSent) {
+    res.status(500).json({ error: { message: "All available Notion accounts failed authorization.", type: "notion_proxy_error" } });
   }
 });
 
