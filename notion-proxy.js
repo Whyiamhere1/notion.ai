@@ -6,7 +6,19 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const autogen = require('./autogen.js');
+
+// Safely require autogen module by its exact file name
+let autogen = null;
+try {
+  autogen = require('./autogen-notion-accounts.js');
+  console.log('[SYSTEM] Successfully loaded autogen account generator module.');
+} catch (e1) {
+  try {
+    autogen = require('./autogen.js');
+  } catch (e2) {
+    console.warn('[WARNING] autogen module not found. Proxy will rely strictly on notion-tokens.txt.');
+  }
+}
 
 async function getProxyAgent(proxyUrl) {
   if (!proxyUrl) return undefined;
@@ -39,7 +51,25 @@ const accountCache = new Map();
 
 function loadTokens() {
   NOTION_TOKENS = [];
-  if (fs.existsSync(TOKENS_FILE)) {
+
+  // 1. Try loading from Environment Variable
+  if (process.env.NOTION_TOKENS) {
+    const rawEnv = process.env.NOTION_TOKENS.split(/[\r\n,]+/);
+    for (const line of rawEnv) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line.trim());
+        if (parsed.cookieString && parsed.userId !== 'isNotionError') {
+          NOTION_TOKENS.push(parsed);
+          continue;
+        }
+      } catch {}
+      NOTION_TOKENS.push({ cookieString: line.trim() });
+    }
+  }
+
+  // 2. Fallback to reading notion-tokens.txt
+  if (!NOTION_TOKENS.length && fs.existsSync(TOKENS_FILE)) {
     try {
       const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
       const lines = raw.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
@@ -51,10 +81,12 @@ function loadTokens() {
             continue;
           }
         } catch {}
+        NOTION_TOKENS.push({ cookieString: line });
       }
-      console.log(`[TOKENS] Loaded ${NOTION_TOKENS.length} valid accounts.`);
     } catch {}
   }
+
+  console.log(`[TOKENS] Loaded ${NOTION_TOKENS.length} valid accounts into pool.`);
 }
 
 async function getNextAccount() {
@@ -62,17 +94,20 @@ async function getNextAccount() {
     loadTokens();
   }
   
-  // Self-healing: Automatically create a new account if pool is empty
+  // If pool is empty, attempt on-demand account creation via autogen
   if (!NOTION_TOKENS.length) {
-    console.log(`[PROXY] Pool empty! Requesting autogen to create a fresh token...`);
-    try {
-      const newAcc = await autogen.getNotionToken();
-      if (newAcc && newAcc.cookieString) {
-        NOTION_TOKENS.push(newAcc);
-        return newAcc;
+    if (autogen && typeof autogen.getNotionToken === 'function') {
+      console.log(`[PROXY] Token pool empty! Triggering autogen for a fresh live token...`);
+      try {
+        const newAcc = await autogen.getNotionToken();
+        if (newAcc && (newAcc.cookieString || typeof newAcc === 'string')) {
+          const formatted = typeof newAcc === 'string' ? { cookieString: newAcc } : newAcc;
+          NOTION_TOKENS.push(formatted);
+          return formatted;
+        }
+      } catch (err) {
+        console.error(`[AUTOGEN ERROR] Live account creation failed:`, err.message);
       }
-    } catch (err) {
-      console.error(`[AUTOGEN ERROR] Failed live account creation:`, err.message);
     }
     throw new Error("No Notion tokens available in pool.");
   }
@@ -85,7 +120,7 @@ async function getNextAccount() {
 function purgeAccount(cookieString) {
   NOTION_TOKENS = NOTION_TOKENS.filter(a => a.cookieString !== cookieString);
   accountCache.delete(cookieString);
-  console.log(`[PROXY] Purged 401 token. Remaining: ${NOTION_TOKENS.length}`);
+  console.log(`[PROXY] Purged dead 401 token. Remaining active tokens: ${NOTION_TOKENS.length}`);
 }
 
 const MODEL_MAP = {
@@ -95,7 +130,10 @@ const MODEL_MAP = {
   "default": "olive-jellyroll"
 };
 
+// ── BULLETPROOF ACCOUNT RESOLVER ───────────────────────────────────────────
+
 async function getNotionAccountInfo(accountObj, proxyUrl) {
+  // Direct Fast-Path: Use pre-resolved IDs from autogen
   if (accountObj.userId && accountObj.spaceId && accountObj.userId !== 'isNotionError') {
     return { userId: accountObj.userId, spaceId: accountObj.spaceId };
   }
@@ -135,7 +173,7 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
           if (unique.length >= 2) {
             return resolve({ userId: unique[0], spaceId: unique[1] });
           }
-          reject(new Error("Could not resolve workspace IDs."));
+          reject(new Error("Could not resolve workspace IDs from Notion response."));
         } catch (e) {
           reject(new Error(`Failed to parse getSpaces: ${e.message}`));
         }
@@ -148,7 +186,7 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT ────────────────────────────────────────────────────
+// ── HTTP PROXY TRANSPORT WITH BEARER TOKEN ──────────────────────────────────
 
 async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
   const agent = await getProxyAgent(proxyUrl);
@@ -193,7 +231,14 @@ async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
   });
 }
 
-// ── OPENAI COMPATIBLE COMPLETIONS ──────────────────────────────────────────
+// ── OPENAI COMPATIBLE ROUTES ─────────────────────────────────────────────────
+
+app.get('/v1/models', (req, res) => {
+  res.json({
+    object: "list",
+    data: Object.keys(MODEL_MAP).map(m => ({ id: m, object: "model", created: 1700000000, owned_by: "notion-ai" }))
+  });
+});
 
 app.post('/v1/chat/completions', async (req, res) => {
   const completionId = 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
@@ -236,7 +281,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const notionRes = await fetchNotionAI(notionPayload, accountObj.cookieString, accountInfo.userId, accountInfo.spaceId);
 
     if (notionRes.statusCode === 401) {
-      console.error(`[401 UNAUTHORIZED] Purging expired token.`);
+      console.error(`[401 UNAUTHORIZED] Expired session encountered. Purging token.`);
       purgeAccount(accountObj.cookieString);
       if (!res.headersSent) {
         return res.status(401).json({ error: { message: "Account unauthorized. Token purged.", type: "notion_unauthorized" } });
