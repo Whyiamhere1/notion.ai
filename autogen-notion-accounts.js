@@ -7,6 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const fsPromises = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
 
 let _SPA, _HPA, _HSPA;
 async function loadSPA() { if (!_SPA) { const m = await import('socks-proxy-agent'); _SPA = m.SocksProxyAgent; } return _SPA; }
@@ -15,22 +16,32 @@ async function loadHSPA() { if (!_HSPA) { const m = await import('https-proxy-ag
 
 puppeteer.use(StealthPlugin());
 
-const TOKENS_FILE = path.join(__dirname, 'notion-tokens.txt');
-const POOL_STATE_FILE = path.join(__dirname, 'notion-pool.json');
-const PROXIES_FILE = path.join(__dirname, 'proxies.txt');
-const PROXY_HEALTH_FILE = path.join(__dirname, 'notion-proxy-health.json');
+// ── Config & File Paths ─────────────────────────────────────────────────────
 
-const TARGET_POOL_SIZE = 10;
-const MIN_POOL_SIZE = 3;
-const MAX_CONCURRENT_FILLS = 2;
+const IS_SERVERLESS = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME || !!process.env.RENDER;
+const TMP_DIR = IS_SERVERLESS ? '/tmp' : __dirname;
+
+const TOKENS_FILE = path.join(TMP_DIR, 'notion-tokens.txt');
+const POOL_STATE_FILE = path.join(TMP_DIR, 'notion-pool.json');
+const PROXIES_FILE = path.join(TMP_DIR, 'proxies.txt');
+const PROXY_HEALTH_FILE = path.join(TMP_DIR, 'notion-proxy-health.json');
+
+const TARGET_POOL_SIZE = 20;
+const MIN_POOL_SIZE = 5;
+const MAX_CONCURRENT_FILLS = 3;
+const PROXY_REFRESH_MS = 15 * 60 * 1000;
 
 const PROXIFLY_URL = 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt';
 const PROXYSCRAPE_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=5000&status=alive';
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// ── Advanced Proxy Health & Pool Tracker ─────────────────────────────────────
+
 let cachedProxies = [];
 let proxiesLoaded = false;
+let refreshRunning = false;
+let refreshPromise = null;
 const provenProxies = [];
 const provenProxiesSet = new Set();
 const proxyHealth = new Map();
@@ -52,7 +63,7 @@ function loadProxies() {
 function getHealth(proxy) {
   let h = proxyHealth.get(proxy);
   if (!h) {
-    h = { ok: 0, fail: 0, blocked: false, coolingUntil: 0, inUse: 0 };
+    h = { ok: 0, fail: 0, lastOk: 0, blocked: false, coolingUntil: 0, inUse: 0 };
     proxyHealth.set(proxy, h);
   }
   return h;
@@ -62,7 +73,7 @@ function recordProxyResult(proxy, success) {
   if (!proxy) return;
   const h = getHealth(proxy);
   if (success) {
-    h.ok++; h.blocked = false; h.coolingUntil = 0;
+    h.ok++; h.lastOk = Date.now(); h.blocked = false; h.coolingUntil = 0;
     if (!provenProxiesSet.has(proxy)) { provenProxies.push(proxy); provenProxiesSet.add(proxy); }
   } else {
     h.fail++;
@@ -78,6 +89,7 @@ function acquireProxy(proxy) { getHealth(proxy).inUse++; }
 function releaseProxy(proxy) { const h = getHealth(proxy); if (h.inUse > 0) h.inUse--; }
 
 function pickProxy() {
+  if (process.env.ROTATING_PROXY_URL) return process.env.ROTATING_PROXY_URL;
   loadProxies();
   const now = Date.now();
   if (provenProxies.length) {
@@ -125,7 +137,7 @@ async function fetchWithProxy(url, options = {}, proxy) {
   });
 }
 
-// ── Mail.tm API ─────────────────────────────────────────────────────────────
+// ── Mail.tm Verification Service ───────────────────────────────────────────
 
 async function requestJSON(url, options = {}, bodyData = null, proxy = null) {
   const headers = { 'User-Agent': USER_AGENT, ...(options.headers || {}) };
@@ -165,7 +177,7 @@ async function waitForNotionCode(authToken, proxy) {
   throw new Error('Verification code timed out');
 }
 
-// ── AUTHENTICATED ACCOUNT CREATOR ──────────────────────────────────────────
+// ── Account Creator with Session Verification ──────────────────────────────
 
 async function createAccountWithWorkspace(proxy) {
   const { email, authToken } = await createTempMailbox(proxy);
@@ -190,7 +202,6 @@ async function createAccountWithWorkspace(proxy) {
     const codeInput = await page.waitForSelector('input[placeholder*="code"], input[type="text"]', { timeout: 15000 });
     await codeInput.type(code, { delay: 40 });
 
-    // Click submit/continue button in UI
     const submitBtn = await page.evaluateHandle(() => {
       const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
       return btns.find(b => {
@@ -199,33 +210,22 @@ async function createAccountWithWorkspace(proxy) {
       });
     });
 
-    if (submitBtn) {
-      await submitBtn.click();
-    } else {
-      await page.keyboard.press('Enter');
-    }
+    if (submitBtn) await submitBtn.click();
+    else await page.keyboard.press('Enter');
 
-    console.log(`[4/5] Submitted code. Verifying authentication token...`);
+    console.log(`[4/5] Submitted code. Verifying authenticated session...`);
 
-    // VERIFY AUTHENTICATION: Wait until token_v2 exists in browser cookies
+    // Verify authenticated token_v2 issue
     let authenticated = false;
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 1000));
       const cookies = await page.cookies();
       const tokenCookie = cookies.find(c => c.name === 'token_v2');
-      if (tokenCookie && tokenCookie.value) {
-        authenticated = true;
-        break;
-      }
+      if (tokenCookie && tokenCookie.value) { authenticated = true; break; }
     }
 
-    if (!authenticated) {
-      throw new Error('Authentication failed: token_v2 was not issued after code submission.');
-    }
+    if (!authenticated) throw new Error('Authentication failed: token_v2 cookie was not issued');
 
-    console.log(`[AUTH] token_v2 verified! Resolving workspace IDs...`);
-
-    // Navigate to workspace home page to complete onboarding
     await page.goto('https://www.notion.so/', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
 
     let verification = null;
@@ -245,7 +245,7 @@ async function createAccountWithWorkspace(proxy) {
           if (!spacesRes.ok) return { success: false, reason: `getSpaces status ${spacesRes.status}` };
           
           const spacesData = await spacesRes.json();
-          if (spacesData.isNotionError) return { success: false, reason: 'Waiting for session initialization...' };
+          if (spacesData.isNotionError) return { success: false, reason: 'Initializing session...' };
 
           let userId = null;
           let spaceId = null;
@@ -268,7 +268,6 @@ async function createAccountWithWorkspace(proxy) {
 
           if (spaceId && uuidRegex.test(spaceId)) return { success: true, spaceId, userId };
 
-          // Create Personal Space via in-page API
           const createRes = await fetch('/api/v3/createSpace', {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-notion-active-user-header': userId },
@@ -301,7 +300,8 @@ async function createAccountWithWorkspace(proxy) {
     return {
       cookieString: fullCookieString,
       userId: verification.userId,
-      spaceId: verification.spaceId
+      spaceId: verification.spaceId,
+      bornAt: Date.now()
     };
 
   } catch (err) {
@@ -334,12 +334,13 @@ async function fillPool() {
     if (proxy) acquireProxy(proxy);
     try {
       const acc = await createAccountWithWorkspace(proxy);
-      pool.push({ ...acc, proxy, createdAt: Date.now() });
+      pool.push({ ...acc, proxy });
       
       const recordLine = JSON.stringify({
         cookieString: acc.cookieString,
         userId: acc.userId,
-        spaceId: acc.spaceId
+        spaceId: acc.spaceId,
+        bornAt: acc.bornAt
       });
       fs.appendFileSync(TOKENS_FILE, recordLine + '\n', 'utf-8');
       
@@ -370,10 +371,10 @@ loadPool();
 async function getNotionToken() {
   let acc = grabToken();
   if (!acc) {
-    console.log(`[AUTOGEN] Creating fresh authenticated account...`);
+    console.log(`[AUTOGEN] Creating fresh account live...`);
     const proxy = pickProxy();
     acc = await createAccountWithWorkspace(proxy);
-    pool.push({ ...acc, proxy, createdAt: Date.now() });
+    pool.push({ ...acc, proxy });
     fsPromises.writeFile(POOL_STATE_FILE, JSON.stringify(pool, null, 2), 'utf-8').catch(() => {});
   }
   return acc;
