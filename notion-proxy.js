@@ -15,7 +15,6 @@ async function getProxyAgent(proxyUrl) {
     const protocol = urlObj.protocol.toLowerCase();
 
     if (protocol.startsWith('socks')) {
-      // Handles socks4, socks4a, socks5, socks5h [1]
       const { SocksProxyAgent } = await import('socks-proxy-agent');
       return new SocksProxyAgent(proxyUrl);
     } else if (protocol === 'http:') {
@@ -137,7 +136,7 @@ const MODEL_MAP = {
   "sonnet": "olive-jellyroll",
   "gpt-4o": "oval-kumquat-medium",
   "gpt-4o-mini": "oregon-grape-medium",
-  "default": "agave-flan"
+  "default": "olive-jellyroll"
 };
 
 let currentTokenIndex = 0;
@@ -242,7 +241,8 @@ async function fetchNotionAI(payload, rawToken, userId, spaceId, proxyUrl) {
         'Origin': 'https://www.notion.so',
         'Referer': 'https://www.notion.so/',
         'x-notion-active-user-header': userId,
-        'x-notion-space-id': spaceId
+        'x-notion-space-id': spaceId,
+        'x-notion-client-version': '23.13.20260313.1423'
       }
     }, res => {
       recordProxyResult(proxyUrl, res.statusCode);
@@ -303,7 +303,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     const threadId = crypto.randomUUID();
+
+    // FIXED PAYLOAD: Added taskType, traceId, and complete config schema
     const notionPayload = {
+      taskType: "workflow",
+      traceId: crypto.randomUUID(),
       spaceId: accountInfo.spaceId,
       threadId: threadId,
       createThread: true,
@@ -313,12 +317,19 @@ app.post('/v1/chat/completions', async (req, res) => {
         {
           id: crypto.randomUUID(),
           type: "config",
-          value: { type: "thread", model: notionModel, useWebSearch: true }
+          value: { 
+            type: "thread", 
+            model: notionModel, 
+            useWebSearch: true 
+          }
         },
         {
           id: crypto.randomUUID(),
           type: "context",
-          value: { userName: "User", surface: "workflows" }
+          value: { 
+            userName: "User", 
+            surface: "workflows" 
+          }
         },
         {
           id: crypto.randomUUID(),
@@ -330,7 +341,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       ]
     };
 
-    console.log(`[REQUEST] Model: ${notionModel} | Proxy: ${proxyUrl || 'Direct'}`);
+    console.log(`[REQUEST] Model: ${notionModel} | User: ${accountInfo.userId} | Proxy: ${proxyUrl || 'Direct'}`);
 
     const notionRes = await fetchNotionAI(
       notionPayload, 
