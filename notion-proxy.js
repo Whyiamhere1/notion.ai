@@ -8,14 +8,17 @@ const path = require('path');
 const crypto = require('crypto');
 
 let autogen = null;
+let autogenLoaded = false;
 try {
   autogen = require('./autogen-notion-accounts.js');
+  autogenLoaded = true;
   console.log('[SYSTEM] Loaded autogen account generator module.');
 } catch (e1) {
   try {
     autogen = require('./autogen.js');
+    autogenLoaded = true;
   } catch (e2) {
-    console.warn('[WARNING] autogen module not found. Proxy will rely strictly on notion-tokens.txt.');
+    console.warn('[WARNING] autogen module not found (Puppeteer/Chromium unavailable). Proxy running in standalone mode.');
   }
 }
 
@@ -46,6 +49,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const TOKENS_FILE = path.join(__dirname, 'notion-tokens.txt');
 let NOTION_TOKENS = [];
+const DEAD_TOKENS = new Set(); // Prevents infinite re-loading of purged 401 tokens
 const accountCache = new Map();
 
 function parseAccountLine(line) {
@@ -63,28 +67,32 @@ function parseAccountLine(line) {
 function loadTokens() {
   NOTION_TOKENS = [];
 
-  // 1. Environment Variable (Render)
+  // 1. Load from Environment Variable
   if (process.env.NOTION_TOKENS) {
     const rawEnv = process.env.NOTION_TOKENS.split(/[\r\n]+/);
     for (const line of rawEnv) {
       const acc = parseAccountLine(line);
-      if (acc) NOTION_TOKENS.push(acc);
+      if (acc && !DEAD_TOKENS.has(acc.cookieString)) {
+        NOTION_TOKENS.push(acc);
+      }
     }
   }
 
-  // 2. Local file
+  // 2. Load from local file
   if (!NOTION_TOKENS.length && fs.existsSync(TOKENS_FILE)) {
     try {
       const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
       const lines = raw.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
       for (const line of lines) {
         const acc = parseAccountLine(line);
-        if (acc) NOTION_TOKENS.push(acc);
+        if (acc && !DEAD_TOKENS.has(acc.cookieString)) {
+          NOTION_TOKENS.push(acc);
+        }
       }
     } catch {}
   }
 
-  console.log(`[TOKENS] Loaded ${NOTION_TOKENS.length} account cookie sets.`);
+  console.log(`[TOKENS] Loaded ${NOTION_TOKENS.length} valid accounts into pool (${DEAD_TOKENS.size} blacklisted).`);
 }
 
 async function getNextAccount() {
@@ -93,8 +101,8 @@ async function getNextAccount() {
   }
   
   if (!NOTION_TOKENS.length) {
-    if (autogen && typeof autogen.getNotionToken === 'function') {
-      console.log(`[PROXY] Token pool empty! Triggering autogen for a fresh live token...`);
+    if (autogenLoaded && autogen && typeof autogen.getNotionToken === 'function') {
+      console.log(`[PROXY] Pool empty! Triggering autogen for a fresh live token...`);
       try {
         const newAcc = await autogen.getNotionToken();
         if (newAcc && (newAcc.cookieString || typeof newAcc === 'string')) {
@@ -106,7 +114,7 @@ async function getNextAccount() {
         console.error(`[AUTOGEN ERROR] Live account creation failed:`, err.message);
       }
     }
-    throw new Error("No Notion tokens available in pool.");
+    throw new Error("No valid Notion tokens available in pool. Please set a valid token in Render NOTION_TOKENS env variable.");
   }
 
   const acc = NOTION_TOKENS.shift();
@@ -115,9 +123,10 @@ async function getNextAccount() {
 }
 
 function purgeAccount(cookieString) {
+  DEAD_TOKENS.add(cookieString);
   NOTION_TOKENS = NOTION_TOKENS.filter(a => a.cookieString !== cookieString);
   accountCache.delete(cookieString);
-  console.log(`[PROXY] Purged dead token. Remaining active tokens: ${NOTION_TOKENS.length}`);
+  console.log(`[PROXY] Purged dead 401 token. Active: ${NOTION_TOKENS.length} | Blacklisted: ${DEAD_TOKENS.size}`);
 }
 
 const MODEL_MAP = {
@@ -127,7 +136,7 @@ const MODEL_MAP = {
   "default": "olive-jellyroll"
 };
 
-// ── FIXED ACCOUNT RESOLVER WITH BEARER AUTH ─────────────────────────────────
+// ── FAST-PATH ACCOUNT RESOLVER ─────────────────────────────────────────────
 
 async function getNotionAccountInfo(accountObj, proxyUrl) {
   // FAST-PATH: Use pre-resolved IDs directly without calling getSpaces
@@ -296,7 +305,17 @@ async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
   });
 }
 
-// ── OPENAI COMPATIBLE ROUTES WITH RETRY AUTOMATION ──────────────────────────
+// ── OPENAI COMPATIBLE ROUTES & STATUS ENDPOINT ──────────────────────────────
+
+app.get('/v1/status', (req, res) => {
+  res.json({
+    status: "online",
+    activeTokens: NOTION_TOKENS.length,
+    blacklistedTokens: DEAD_TOKENS.size,
+    autogenAvailable: autogenLoaded,
+    models: Object.keys(MODEL_MAP)
+  });
+});
 
 app.get('/v1/models', (req, res) => {
   res.json({
@@ -349,9 +368,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       const notionRes = await fetchNotionAI(notionPayload, accountObj.cookieString, accountInfo.userId, accountInfo.spaceId);
 
       if (notionRes.statusCode === 401) {
-        console.error(`[401 UNAUTHORIZED] Expired session. Purging token and retrying...`);
+        console.error(`[401 UNAUTHORIZED] Purging blacklisted token...`);
         purgeAccount(accountObj.cookieString);
-        continue; // Auto-retry with next available token
+        continue;
       }
 
       if (notionRes.statusCode >= 400) {
@@ -390,7 +409,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
 
-      return; // Success!
+      return;
 
     } catch (err) {
       console.error(`[ACCOUNT RESOLVE ERROR]`, err.message);
