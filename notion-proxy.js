@@ -33,10 +33,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const TOKENS_FILE = path.join(__dirname, 'notion-tokens.txt');
-const PROXIES_FILE = path.join(__dirname, 'proxies.txt');
-
 let NOTION_TOKENS = [];
-let PROXY_LIST = [];
 const accountCache = new Map();
 
 function loadTokens() {
@@ -70,6 +67,12 @@ function getNextAccount() {
   return acc;
 }
 
+function purgeAccount(cookieString) {
+  NOTION_TOKENS = NOTION_TOKENS.filter(a => a.cookieString !== cookieString);
+  accountCache.delete(cookieString);
+  console.log(`[PROXY] Purged dead 401 token from pool. Remaining: ${NOTION_TOKENS.length}`);
+}
+
 const MODEL_MAP = {
   "claude-opus-5": "agave-flan",
   "claude-sonnet-5": "olive-jellyroll",
@@ -77,16 +80,12 @@ const MODEL_MAP = {
   "default": "olive-jellyroll"
 };
 
-// ── BULLETPROOF ACCOUNT RESOLVER ───────────────────────────────────────────
-
 async function getNotionAccountInfo(accountObj, proxyUrl) {
-  // Direct Fast-Path: Use pre-resolved IDs from autogen
   if (accountObj.userId && accountObj.spaceId) {
     return { userId: accountObj.userId, spaceId: accountObj.spaceId };
   }
 
   const cookieString = accountObj.cookieString || accountObj;
-  
   let userId = null;
   const userMatch = cookieString.match(/notion_user_id=([0-9a-f-]{36})/i);
   if (userMatch) userId = userMatch[1];
@@ -141,7 +140,6 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
           }
 
           if (userId && spaceId) {
-            console.log(`[RESOLVED FALLBACK] User: ${userId} | Space: ${spaceId}`);
             return resolve({ userId, spaceId });
           }
           reject(new Error("Could not resolve workspace IDs."));
@@ -157,11 +155,32 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT ────────────────────────────────────────────────────
+// ── HTTP PROXY TRANSPORT WITH BEARER TOKEN ──────────────────────────────────
 
 async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
   const agent = await getProxyAgent(proxyUrl);
   const postData = JSON.stringify(payload);
+
+  // FIX: Extract token_v2 value for Bearer Header
+  const tokenMatch = cookieString.match(/token_v2=([^;]+)/i);
+  let rawToken = tokenMatch ? tokenMatch[1] : '';
+  try { rawToken = decodeURIComponent(rawToken); } catch {}
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(postData),
+    'Cookie': cookieString,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Origin': 'https://www.notion.so',
+    'Referer': 'https://www.notion.so/',
+    'x-notion-active-user-header': userId,
+    'x-notion-space-id': spaceId,
+    'x-notion-client-version': '23.13.20260313.1423'
+  };
+
+  if (rawToken) {
+    headers['Authorization'] = `Bearer ${rawToken}`;
+  }
 
   return new Promise((resolve, reject) => {
     const req = https.request({
@@ -170,17 +189,7 @@ async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
       path: '/api/v3/runInferenceTranscript',
       method: 'POST',
       agent,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-        'Cookie': cookieString,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Origin': 'https://www.notion.so',
-        'Referer': 'https://www.notion.so/',
-        'x-notion-active-user-header': userId,
-        'x-notion-space-id': spaceId,
-        'x-notion-client-version': '23.13.20260313.1423'
-      }
+      headers
     }, res => {
       resolve(res);
     });
@@ -228,10 +237,24 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const notionRes = await fetchNotionAI(notionPayload, accountObj.cookieString, accountInfo.userId, accountInfo.spaceId);
 
+    // FIX: Automatically purge dead/unauthenticated accounts on 401
+    if (notionRes.statusCode === 401) {
+      console.error(`[401 UNAUTHORIZED] Purging expired token from pool.`);
+      purgeAccount(accountObj.cookieString);
+      if (!res.headersSent) {
+        return res.status(401).json({ error: { message: "Account unauthorized. Token purged.", type: "notion_unauthorized" } });
+      }
+      return;
+    }
+
     if (notionRes.statusCode >= 400) {
       let body = '';
       notionRes.on('data', d => body += d);
-      notionRes.on('end', () => res.status(notionRes.statusCode).json({ error: `Notion Error ${notionRes.statusCode}`, details: body }));
+      notionRes.on('end', () => {
+        if (!res.headersSent) {
+          res.status(notionRes.statusCode).json({ error: `Notion Error ${notionRes.statusCode}`, details: body });
+        }
+      });
       return;
     }
 
