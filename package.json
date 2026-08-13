@@ -1,15 +1,19 @@
 {
-  "name": "notion-proxy",
+  "name": "notion-ai-proxy",
   "version": "1.0.0",
-  "description": "Notion AI Proxy Server",
-  "main": "notion-proxy.js.txt",
+  "description": "Notion AI Proxy with HTTP, HTTPS, SOCKS4, and SOCKS5 support",
+  "main": "notion-proxy.js",
   "scripts": {
-    "start": "node notion-proxy.js.txt"
+    "start": "node notion-proxy.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "https-proxy-agent": "^7.0.4",
-    "socks-proxy-agent": "^8.0.3"
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.5",
+    "socks-proxy-agent": "^8.0.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
