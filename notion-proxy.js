@@ -15,7 +15,7 @@ try {
   try {
     autogen = require('./autogen.js');
   } catch (e2) {
-    console.warn('[WARNING] autogen module not found. Proxy will rely strictly on notion-tokens.txt.');
+    console.warn('[WARNING] autogen module not found. Running in standalone proxy mode.');
   }
 }
 
@@ -63,7 +63,6 @@ function parseAccountLine(line) {
 function loadTokens() {
   NOTION_TOKENS = [];
 
-  // 1. Try Environment Variable (Render)
   if (process.env.NOTION_TOKENS) {
     const rawEnv = process.env.NOTION_TOKENS.split(/[\r\n]+/);
     for (const line of rawEnv) {
@@ -72,7 +71,6 @@ function loadTokens() {
     }
   }
 
-  // 2. Fallback to local file
   if (!NOTION_TOKENS.length && fs.existsSync(TOKENS_FILE)) {
     try {
       const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
@@ -130,7 +128,7 @@ const MODEL_MAP = {
 // ── FAST-PATH ACCOUNT RESOLVER ─────────────────────────────────────────────
 
 async function getNotionAccountInfo(accountObj, proxyUrl) {
-  // FAST-PATH: Use pre-resolved IDs directly without calling getSpaces
+  // FAST-PATH: If userId and spaceId are pre-resolved, bypass getSpaces completely
   if (accountObj.userId && accountObj.spaceId && accountObj.userId !== 'isNotionError') {
     return { userId: accountObj.userId, spaceId: accountObj.spaceId };
   }
@@ -165,7 +163,8 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
         'sec-ch-ua-platform': '"Windows"',
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin'
+        'sec-fetch-site': 'same-origin',
+        'x-notion-active-user-header': userId || ''
       }
     }, res => {
       let body = '';
@@ -221,7 +220,7 @@ async function getNotionAccountInfo(accountObj, proxyUrl) {
   });
 }
 
-// ── HTTP PROXY TRANSPORT ────────────────────────────────────────────────────
+// ── HTTP PROXY TRANSPORT WITH BROWSER HEADERS ───────────────────────────────
 
 async function fetchNotionAI(payload, cookieString, userId, spaceId, proxyUrl) {
   const agent = await getProxyAgent(proxyUrl);
