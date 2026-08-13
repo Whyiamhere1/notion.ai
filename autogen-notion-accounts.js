@@ -24,7 +24,6 @@ async function loadHSPA() {
 
 puppeteer.use(StealthPlugin());
 
-// ── Config ──────────────────────────────────────────────────────────────────
 const TOKENS_FILE = path.join(__dirname, 'notion-tokens.txt');
 const POOL_STATE_FILE = path.join(__dirname, 'notion-pool.json');
 const PROXIES_FILE = path.join(__dirname, 'proxies.txt');
@@ -33,8 +32,6 @@ const PROXY_HEALTH_FILE = path.join(__dirname, 'notion-proxy-health.json');
 const TARGET_POOL_SIZE = 20;
 const MIN_POOL_SIZE = 8;
 const MAX_CONCURRENT_FILLS = 3;
-const BATCH_SIZE = 5;
-const PROXY_REFRESH_MS = 15 * 60 * 1000;
 
 const PROXIFLY_URL = 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt';
 const PROXYSCRAPE_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=5000&status=alive';
@@ -97,25 +94,6 @@ function recordProxyResult(proxy, success) {
       }
     }
   }
-  persistProxyHealthAsync();
-}
-
-function markProxyBlocked(proxy) {
-  if (!proxy) return;
-  const h = getHealth(proxy);
-  h.blocked = true;
-  const idx = provenProxies.indexOf(proxy);
-  if (idx !== -1) {
-    provenProxies.splice(idx, 1);
-    provenProxiesSet.delete(proxy);
-  }
-  persistProxyHealthAsync();
-}
-
-function cooldownProxy(proxy, ms) {
-  if (!proxy) return;
-  const h = getHealth(proxy);
-  h.coolingUntil = Math.max(h.coolingUntil, Date.now() + ms);
   persistProxyHealthAsync();
 }
 
@@ -204,8 +182,6 @@ async function refreshProxies() {
   return refreshPromise;
 }
 
-const MAX_PROXY_CONCURRENT = 2;
-
 function pickProxy() {
   loadProxies();
   const now = Date.now();
@@ -219,23 +195,12 @@ function pickProxy() {
     for (const p of shuffled) {
       const h = proxyHealth.get(p);
       if (!h) return p;
-      if (h.blocked || h.coolingUntil > now || h.inUse >= MAX_PROXY_CONCURRENT) continue;
+      if (h.blocked || h.coolingUntil > now || h.inUse >= 2) continue;
       return p;
-    }
-    const usable = shuffled.filter(p => !proxyHealth.get(p)?.blocked);
-    if (usable.length > 0) {
-      return usable.sort((a, b) => (proxyHealth.get(a)?.inUse || 0) - (proxyHealth.get(b)?.inUse || 0))[0];
     }
   }
 
   if (!cachedProxies.length) return undefined;
-  for (let i = 0; i < 30; i++) {
-    const p = cachedProxies[Math.floor(Math.random() * cachedProxies.length)];
-    const h = proxyHealth.get(p);
-    if (!h) return p;
-    if (h.blocked || h.coolingUntil > now) continue;
-    return p;
-  }
   return cachedProxies[Math.floor(Math.random() * cachedProxies.length)];
 }
 
@@ -328,7 +293,7 @@ async function waitForNotionCode(authToken, proxy) {
   throw new Error('Verification code timed out');
 }
 
-// ── Notion Account Creation (AUTOMATIC FULL COOKIE EXTRACTION) ──────────────
+// ── Notion Account Creation ─────────────────────────────────────────────────
 async function createAccountWithWorkspace(proxy) {
   const { email, authToken } = await createTempMailbox(proxy);
   console.log(`[1/5] Temp Email Created: ${email} (via ${proxy || 'Direct'})`);
@@ -402,11 +367,10 @@ async function createAccountWithWorkspace(proxy) {
 
     if (!verification || !verification.success) throw new Error('Workspace creation failed');
 
-    // FIXED: EXTRACT THE FULL COOKIE JAR FROM PUPPETEER
     const rawCookies = await page.cookies('https://www.notion.so', 'https://app.notion.so');
     const fullCookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    console.log(`[5/5] SUCCESS! Extracted full session cookies for Space ID: ${verification.spaceId}`);
+    console.log(`[5/5] SUCCESS! Space ID: ${verification.spaceId} | User ID: ${verification.userId}`);
     await browser.close();
 
     return {
@@ -424,7 +388,6 @@ async function createAccountWithWorkspace(proxy) {
 // ── Account Pool Management ────────────────────────────────────────────────
 let pool = [];
 let fillInProgress = 0;
-let fillPromise = null;
 let warmed = false;
 let fillStats = { attempts: 0, successes: 0, failures: 0 };
 
@@ -459,8 +422,13 @@ async function fillPool() {
       const acc = await createAccountWithWorkspace(proxy);
       pool.push({ ...acc, proxy, createdAt: Date.now() });
       
-      // Save full cookie string into notion-tokens.txt
-      fs.appendFileSync(TOKENS_FILE, acc.cookieString + '\n', 'utf-8');
+      // Save structured JSON line to notion-tokens.txt
+      const recordLine = JSON.stringify({
+        cookieString: acc.cookieString,
+        userId: acc.userId,
+        spaceId: acc.spaceId
+      });
+      fs.appendFileSync(TOKENS_FILE, recordLine + '\n', 'utf-8');
       
       fillStats.successes++;
       if (proxy) recordProxyResult(proxy, true);
@@ -481,7 +449,7 @@ function grabToken() {
   if (pool.length > 0) {
     const item = pool.pop();
     persistPoolAsync();
-    return item.cookieString;
+    return item;
   }
   return null;
 }
@@ -501,15 +469,14 @@ loadProxyHealth();
 warmPool();
 
 async function getNotionToken() {
-  let cookieString = grabToken();
-  if (!cookieString) {
+  let acc = grabToken();
+  if (!acc) {
     const proxy = pickProxy();
-    const acc = await createAccountWithWorkspace(proxy);
-    cookieString = acc.cookieString;
+    acc = await createAccountWithWorkspace(proxy);
     pool.push({ ...acc, proxy, createdAt: Date.now() });
     persistPoolAsync();
   }
-  return cookieString;
+  return acc;
 }
 
 setInterval(() => {}, 1 << 30);
